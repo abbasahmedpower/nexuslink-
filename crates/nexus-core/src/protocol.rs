@@ -25,14 +25,24 @@ pub struct Identity {
 }
 
 pub fn parse_identity(input: &[u8]) -> Option<Identity> {
-    if input.len() > MAX_DATAGRAM { return None; }
+    if input.len() > MAX_DATAGRAM {
+        return None;
+    }
     let packet: Packet = serde_json::from_slice(input).ok()?;
-    if packet.kind != "kdeconnect.identity" { return None; }
+    if packet.kind != "kdeconnect.identity" {
+        return None;
+    }
     let peer: Identity = serde_json::from_value(packet.body).ok()?;
-    if peer.device_id.is_empty() || peer.device_id.len() > 128 ||
-       peer.device_name.is_empty() || peer.device_name.len() > 256 ||
-       peer.device_type.len() > 32 || peer.protocol_version == 0 ||
-       peer.tcp_port == Some(0) { return None; }
+    if peer.device_id.is_empty()
+        || peer.device_id.len() > 128
+        || peer.device_name.is_empty()
+        || peer.device_name.len() > 256
+        || peer.device_type.len() > 32
+        || peer.protocol_version == 0
+        || peer.tcp_port == Some(0)
+    {
+        return None;
+    }
     Some(peer)
 }
 
