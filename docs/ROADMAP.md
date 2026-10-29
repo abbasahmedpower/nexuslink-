@@ -1,13 +1,19 @@
-# Roadmap and acceptance gates
+# Release roadmap (dependency-ordered, no artificial dates)
 
-- [x] P0: Repo skeleton, discovery-only Rust daemon, read-only local status endpoint, Flutter shell, parser tests authored.
-- [ ] P1: Stable machine identity, authenticated KDE Connect TLS handshake/pairing, interoperability tests with official Android peer.
-- [ ] P2: Typed IPC / FRB, device state store, proper event stream, battery, ping, encrypted notifications.
-- [ ] P3: Files, clipboard, secure transfer, resume, content hashes, explicit permission UX.
-- [ ] P4: Android Kotlin app, Android permission flows, notification replies, scoped media, Doze/OEM tests.
-- [ ] P5: ADB/scrcpy integration, hardware video, adaptive bitrate, input-control consent, Wi-Fi/USB switch.
-- [ ] P6: Phone camera/mic with visible consent; virtual camera adapters (Linux/Windows/macOS separately).
-- [ ] P7: SMS/calls when permitted by OS, accessibility, licensing, and app-distribution policies.
-- [ ] P8: Reproducible builds, fuzz/security audits, signed installers, nightly OS/device compatibility.
+| Gate | Outcome | Exit evidence |
+|---|---|---|
+| 0 | Prototype discovery and status UI | Parser/unit tests, bounded state, manual LAN smoke test |
+| 1 | Secure local identity and IPC | Persistent keys, restricted OS IPC, no untrusted commands |
+| 2 | KDE Connect interoperability | Real phone pair/verify/unpair tests; capability negotiation |
+| 3 | Core productivity | Battery, ping, notifications, clipboard with permission tests |
+| 4 | Media | Existing scrcpy subprocess first, live preview and recording with measured latency |
+| 5 | Android companion | Kotlin permissions, lifecycle, notification listener; test OEM restrictions |
+| 6 | File transfer and camera | Stream integrity, resume, camera permission UI, GPU pipeline |
+| 7 | Calls and advanced audio | Bluetooth/telephony compatibility documented per OS |
+| 8 | Release readiness | Multi-OS CI, fuzz/security audit, signed packages, legal notices |
 
-Each gate requires at least one hardware end-to-end acceptance test, not just green unit tests.
+## Optional advanced features (not committed)
+Multi-device sessions; Android-Wear OS companion; system-tray controls; picture-in-picture; audio routing; virtual webcam; file drag-and-drop; E2EE nearby remote access; diagnostics exports; plug-in API; accessibility keyboard controls; QoS auto-tuning.
+
+## Roadmap decisions
+Reuse scrcpy as a managed subprocess before embedding codec/video transport. Avoid a second custom protocol until KDE interoperability has strong contract tests. Use flutter_rust_bridge only when typed bidirectional IPC has a clear benefit over the simpler API. On macOS/iOS, OS permissions and platform limits may block some feature parity.
