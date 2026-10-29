@@ -1,3 +1,10 @@
 [workspace]
-members = ["crates/nexus-core"]
+members = [
+    "crates/nexus-domain",
+    "crates/nexus-adapter-kde",
+    "crates/nexus-adapter-scrcpy",
+    "crates/nexus-application",
+    "crates/nexus-ipc",
+    "crates/nexus-core",
+]
 resolver = "2"
