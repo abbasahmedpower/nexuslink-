@@ -28,6 +28,9 @@ pub enum NexusError {
     SpawnFailed(String),
     #[error("rate-limited")]
     RateLimited,
+    /// Unknown process handle requested an operation (e.g. stop after exit).
+    #[error("unknown-handle")]
+    UnknownHandle,
     #[error("internal")]
     Internal,
 }
@@ -44,6 +47,7 @@ impl NexusError {
             Self::ToolUnavailable(_) => "tool-unavailable",
             Self::SpawnFailed(_) => "spawn-failed",
             Self::RateLimited => "rate-limited",
+            Self::UnknownHandle => "unknown-handle",
             Self::Internal => "internal",
         }
     }

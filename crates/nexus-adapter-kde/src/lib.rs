@@ -152,14 +152,19 @@ pub fn pair_packet(id: u64, our_device_id: &str) -> String {
 /// Read one newline-delimited KDE Connect packet with a HARD byte bound enforced
 /// incrementally (nano-level: an unbounded/never-terminated line can never exhaust
 /// memory — we cap while reading, not after).
-pub async fn read_packet_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+pub async fn read_packet_bounded<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut tokio::io::BufReader<R>,
     max_bytes: usize,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut line = Vec::new();
-    let n = reader.read_until(b'\n', &mut line).await?;
-    if n == 0 {
+    // Nano-level bound: cap consumption at max_bytes+1 *before* checking for a
+    // newline, so an unterminated flood can never allocate beyond the limit.
+    (&mut *reader)
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if line.is_empty() {
         return Ok(None); // clean EOF
     }
     if line.len() > max_bytes {

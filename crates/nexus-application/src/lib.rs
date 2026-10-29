@@ -61,13 +61,15 @@ async fn session_exchange(
     expect_type: &str,
 ) -> Result<(), NexusError> {
     use nexus_adapter_kde::{packet_type, read_packet_bounded, MAX_DATAGRAM};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let stream = time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
         .await
         .map_err(|_| NexusError::NotFound("connect-timeout".into()))?
         .map_err(|_| NexusError::NotFound("unreachable".into()))?;
-    let (mut rd, mut wr) = stream.into_split();
-    let mut buf_reader = tokio::io::BufReader::new(&mut rd);
+    let (rd, mut wr) = stream.into_split();
+    // OwnedReadHalf is AsyncRead but not AsyncBufRead: wrap an owned reader so
+    // the bounded read owns its buffer and stays Send across the timeout.
+    let mut buf_reader = tokio::io::BufReader::new(rd);
     let write = async {
         wr.write_all(packet.as_bytes()).await?;
         wr.write_all(b"\n").await
@@ -89,15 +91,16 @@ async fn session_exchange(
 }
 
 /// Look up a validated device id in the peer store; returns (addr, paired).
-async fn peer_addr(state: &AppState, device_id: &str) -> Result<std::net::SocketAddr, NexusError> {
+async fn peer_addr(state: &AppState, device_id: &str) -> Result<(std::net::SocketAddr, bool), NexusError> {
     if !nexus_domain::valid_device_id(device_id) {
         return Err(NexusError::InvalidDeviceId);
     }
     let now = Instant::now();
-    let peers = state.peers.read().await.snapshot(now);
+    // Take the write lock: snapshot() performs TTL eviction (mutation) inside the store.
+    let peers = state.peers.write().await.snapshot(now);
     let peer = peers.iter().find(|p| p.id == device_id).ok_or(NexusError::NotFound(device_id.into()))?;
     let ip: std::net::IpAddr = peer.address.parse().map_err(|_| NexusError::Internal)?;
-    Ok(std::net::SocketAddr::new(ip, nexus_adapter_kde::KDE_PORT))
+    Ok((std::net::SocketAddr::new(ip, nexus_adapter_kde::KDE_PORT), peer.paired))
 }
 
 async fn handle(state: Arc<AppState>, req: Request) -> Response {
@@ -124,7 +127,7 @@ async fn handle(state: Arc<AppState>, req: Request) -> Response {
         }
         Command::DevicePair { device_id } => {
             match peer_addr(&state, &device_id).await {
-                Ok(addr) => {
+                Ok((addr, _)) => {
                     let pkt = nexus_adapter_kde::pair_packet(1, &state.device_id);
                     match session_exchange(addr, pkt, "kdeconnect.pair").await {
                         Ok(()) => {
@@ -139,10 +142,15 @@ async fn handle(state: Arc<AppState>, req: Request) -> Response {
         }
         Command::DevicePing { device_id } => {
             match peer_addr(&state, &device_id).await {
-                Ok(addr) => match session_exchange(addr, nexus_adapter_kde::ping_packet(1), "kdeconnect.ping").await {
-                    Ok(()) => Response::success(seq, json!({ "reachable": true })),
-                    Err(e) => fail(seq, &e),
-                },
+                // Least-privilege: pinging a discovered-but-unpaired peer would
+                // inject packets into a stranger's session channel. Refuse until paired.
+                Ok((_, false)) => fail(seq, &NexusError::Unauthorized),
+                Ok((addr, true)) => {
+                    match session_exchange(addr, nexus_adapter_kde::ping_packet(1), "kdeconnect.ping").await {
+                        Ok(()) => Response::success(seq, json!({ "reachable": true })),
+                        Err(e) => fail(seq, &e),
+                    }
+                }
                 Err(e) => fail(seq, &e),
             }
         }
@@ -152,6 +160,7 @@ async fn handle(state: Arc<AppState>, req: Request) -> Response {
                 return fail(seq, &NexusError::InvalidInput);
             }
             match peer_addr(&state, &device_id).await {
+                Ok((_, false)) => fail(seq, &NexusError::Unauthorized),
                 Ok(_) => Response::success(seq, json!({ "queued": true, "note": "transfer requires v0.6 TLS session" })),
                 Err(e) => fail(seq, &e),
             }
@@ -160,15 +169,20 @@ async fn handle(state: Arc<AppState>, req: Request) -> Response {
             Ok(handle) => Response::success(seq, json!({ "handle": handle })),
             Err(e) => fail(seq, &e),
         },
-        Command::CameraStart { serial } => match spawn_stream(&state, ManagedKind::ScrcpyCamera, serial, true).await {
-            Ok(handle) => Response::success(seq, json!({ "handle": handle })),
-            Err(e) => fail(seq, &e),
-        },
+
         Command::ProcessStop { handle } => {
+            // Explicit existence check: an unknown/stale handle is a typed error,
+            // NOT a silent success. The UI must be able to distinguish "stopped"
+            // from "was already gone / never existed" (micro-level state honesty).
+            if !state.supervisor.exists(handle) {
+                return fail(seq, &NexusError::UnknownHandle);
+            }
             // stop() is race-safe by construction (channel-based termination);
             // additionally bound it so a wedged reaper can never wedge the handler.
+            // Outer bound must EXCEED the inner grace, otherwise a normal
+            // SIGTERM->SIGKILL escalation (~grace) gets misreported as failure.
             let confirmed = time::timeout(
-                DEFAULT_KILL_GRACE + Duration::from_secs(2),
+                DEFAULT_KILL_GRACE * 2 + Duration::from_secs(2),
                 state.supervisor.stop(handle, DEFAULT_KILL_GRACE),
             )
             .await
@@ -285,7 +299,30 @@ mod tests {
             .await
             .unwrap();
         assert!(!resp.ok);
+        // Validation firewall is environment-independent: a malformed serial must
+        // yield the typed validation error whether or not scrcpy is installed.
+        // (The old assertion of "invalid-device-id" only passed on machines that
+        // happened to have scrcpy on PATH — an accidental test.)
         assert_eq!(resp.error.as_deref(), Some("invalid-device-id"));
+    }
+
+    #[tokio::test]
+    async fn mirror_start_reports_tool_unavailable_when_absent() {
+        // On a host WITHOUT scrcpy, a well-formed serial must surface the typed
+        // preflight error instead of an opaque spawn OS error. Skip gracefully on
+        // hosts where the tool exists so the test is portable across CI images.
+        if binary_on_path("scrcpy") {
+            return;
+        }
+        let state = AppState::new();
+        let addr = serve(state).await;
+        let client = IpcClient::connect(addr, "test-token").await.unwrap();
+        let resp = client
+            .call("mirror_start", json!({ "serial": "emulator-5554" }), 6)
+            .await
+            .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("tool-unavailable"));
     }
 
     #[tokio::test]
