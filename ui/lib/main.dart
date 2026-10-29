@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'backend.dart';
 
 void main() => runApp(const NexusApp());
 class NexusApp extends StatelessWidget {
@@ -10,78 +11,99 @@ class NexusApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
     title: 'Nexus Hub',
-    theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xff4263eb), brightness: Brightness.light),
-    darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xff748ffc), brightness: Brightness.dark),
+    theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xff4263eb)),
+    darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xff4263eb), brightness: Brightness.dark),
     themeMode: ThemeMode.system,
     home: const Dashboard(),
   );
 }
 class Dashboard extends StatefulWidget {
   const Dashboard({super.key});
-  @override
-  State<Dashboard> createState() => _DashboardState();
+  @override State<Dashboard> createState() => _DashboardState();
 }
 class _DashboardState extends State<Dashboard> {
-  int section = 0;
-  List<dynamic> devices = [];
-  String state = 'Checking local Rust daemon...';
-  Timer? refreshTimer;
-  static const names = ['Devices', 'Notifications', 'Messages', 'Photos', 'Mirroring', 'Camera', 'Settings'];
-  static const icons = [Icons.devices, Icons.notifications_outlined, Icons.message_outlined,
-    Icons.photo_outlined, Icons.screen_share_outlined, Icons.camera_alt_outlined, Icons.settings_outlined];
-  @override
-  void initState() { super.initState(); refresh(); refreshTimer = Timer.periodic(const Duration(seconds: 4), (_) => refresh()); }
-  Future<void> refresh() async {
+  final tools = NexusTools();
+  final deviceId = TextEditingController();
+  final adbSerial = TextEditingController();
+  final filePath = TextEditingController();
+  int tab = 0;
+  bool busy = false;
+  String message = 'Install scrcpy and KDE Connect CLI to enable integration';
+  String available = 'Press Refresh to list paired, reachable KDE Connect devices.';
+  List<dynamic> discoveries = [];
+  Timer? timer;
+  static const tabs = ['Devices', 'Pairing', 'Mirroring', 'Camera', 'Files', 'About'];
+  static const icons = [Icons.devices, Icons.link, Icons.screen_share, Icons.camera_alt, Icons.folder, Icons.info_outline];
+  @override void initState() { super.initState(); refreshDiscovery(); timer = Timer.periodic(const Duration(seconds: 8), (_) => refreshDiscovery()); }
+  @override void dispose() { timer?.cancel(); deviceId.dispose(); adbSerial.dispose(); filePath.dispose(); tools.stopMirror(); super.dispose(); }
+  Future<void> execute(Future<ToolResult> Function() action) async {
+    if (busy) return;
+    setState(() => busy = true);
+    final result = await action();
+    if (!mounted) return;
+    setState(() { busy = false; message = '${result.ok ? "OK" : "ERROR"}: ${result.text}'; });
+  }
+  Future<void> refreshKde() async {
+    await execute(() async {
+      final result = await tools.devices();
+      if (mounted) setState(() => available = result.text);
+      return result;
+    });
+  }
+  Future<void> refreshDiscovery() async {
     try {
       final response = await http.get(Uri.parse('http://127.0.0.1:8787/status')).timeout(const Duration(seconds: 2));
-      if (response.statusCode != 200) throw Exception('HTTP ${response.statusCode}');
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      if (!mounted) return;
-      setState(() { devices = data['peers'] as List<dynamic>? ?? []; state = 'Discovery active · pairing not implemented'; });
-    } catch (_) { if (mounted) setState(() { devices = []; state = 'Offline · start nexus-core first'; }); }
+      if (response.statusCode == 200 && mounted) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        setState(() => discoveries = data['peers'] as List<dynamic>? ?? []);
+      }
+    } catch (_) { if (mounted) setState(() => discoveries = []); }
   }
-  @override
-  void dispose() { refreshTimer?.cancel(); super.dispose(); }
-  @override
-  Widget build(BuildContext context) {
+  @override Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return Scaffold(body: SafeArea(child: Row(children: [
-      NavigationRail(
-        extended: MediaQuery.sizeOf(context).width > 940,
-        selectedIndex: section,
-        onDestinationSelected: (i) => setState(() => section = i),
-        leading: const Padding(padding: EdgeInsets.symmetric(vertical: 20), child: Icon(Icons.hub_rounded, size: 32)),
-        destinations: [for (var i = 0; i < names.length; i++) NavigationRailDestination(icon: Icon(icons[i]), label: Text(names[i]))],
-      ),
+      NavigationRail(extended: MediaQuery.sizeOf(context).width > 1020, selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        leading: const Padding(padding: EdgeInsets.all(18), child: Icon(Icons.hub_rounded, size: 30)),
+        destinations: [for (var i = 0; i < tabs.length; i++) NavigationRailDestination(icon: Icon(icons[i]), label: Text(tabs[i]))]),
       const VerticalDivider(width: 1),
-      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Container(padding: const EdgeInsets.all(22), color: cs.surfaceContainerLow, child: Row(children: [
-          const Icon(Icons.hub_rounded), const SizedBox(width: 10),
-          const Text('Nexus Hub', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-          const Spacer(), Flexible(child: Text(state, textAlign: TextAlign.end, style: TextStyle(color: cs.onSurfaceVariant))),
-        ])),
-        Expanded(child: Padding(padding: const EdgeInsets.all(28), child: section == 0 ? devicesView() : featureView())),
+      Expanded(child: Column(children: [
+        Container(color: cs.surfaceContainerLow, padding: const EdgeInsets.all(18), child: Row(children: [
+          const Text('Nexus Hub', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 22)),
+          const Spacer(), Flexible(child: Text('Native adapters · local first', style: TextStyle(color: cs.onSurfaceVariant)))])),
+        Expanded(child: SingleChildScrollView(padding: const EdgeInsets.all(24), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(tabs[tab], style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 18), ...page(), const SizedBox(height: 22),
+          Card(child: Padding(padding: const EdgeInsets.all(16), child: SelectableText(message))),
+        ]))),
       ])),
     ])));
   }
-  Widget devicesView() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-    const Text('Nearby devices', style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
-    const SizedBox(height: 8),
-    const Text('Passive discovery only. Devices are NOT paired, authenticated, or controllable.'),
-    const SizedBox(height: 24),
-    OutlinedButton.icon(onPressed: refresh, icon: const Icon(Icons.refresh), label: const Text('Refresh')),
-    const SizedBox(height: 20),
-    if (devices.isEmpty) const Card(child: Padding(padding: EdgeInsets.all(25), child: Text('No discovered peers yet. Verify both devices are on the same LAN and firewall allows UDP 1716.'))),
-    Expanded(child: ListView(children: [for (final item in devices)
-      Card(child: ListTile(leading: const Icon(Icons.smartphone), title: Text('${item['name']}'),
-        subtitle: Text('${item['address']} · Discovered (untrusted)'), trailing: const Icon(Icons.lock_outline)))
-    ])),
-  ]);
-  Widget featureView() => Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 520),
-    child: Column(mainAxisSize: MainAxisSize.min, children: [
-      Icon(icons[section], size: 56), const SizedBox(height: 20),
-      Text(names[section], style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-      const SizedBox(height: 12),
-      const Text('Planned module — unavailable in this discovery-only starter. No simulated actions or fake connected state.', textAlign: TextAlign.center),
-    ])));
+  Widget action(String label, Future<ToolResult> Function() onTap, IconData icon) =>
+    Padding(padding: const EdgeInsets.only(right: 10, top: 10), child: FilledButton.icon(onPressed: busy ? null : () => execute(onTap), icon: Icon(icon), label: Text(label)));
+  Widget field(TextEditingController c, String label) => Padding(padding: const EdgeInsets.only(bottom: 12),
+    child: TextField(controller: c, decoration: InputDecoration(labelText: label, border: const OutlineInputBorder())));
+  List<Widget> page() {
+    switch (tab) {
+      case 0: return [const Text('KDE Connect manages trusted pairing. Nexus discovery is only a separate, UNTRUSTED LAN observation.'),
+        action('Refresh KDE devices', tools.devices, Icons.refresh),
+        action('Show device list', () async { final r = await tools.devices(); if(mounted) setState(() => available=r.text); return r; }, Icons.list),
+        Card(child: Padding(padding: const EdgeInsets.all(16), child: SelectableText(available))),
+        const Text('Untrusted LAN discovery from Rust Core:'),
+        for(final d in discoveries) ListTile(leading: const Icon(Icons.shield_outlined), title: Text('${d['name']}'), subtitle: Text('${d['address']} (unverified)'))];
+      case 1: return [field(deviceId, 'KDE device ID (from device list)'),
+        Wrap(children: [action('Request pair', () => tools.requestPair(deviceId.text.trim()), Icons.link), action('Ping', () => tools.ping(deviceId.text.trim()), Icons.wifi_tethering)]),
+        const Text('Accept the pairing request on both devices. Never treat an untrusted discovery result as paired.')];
+      case 2: return [field(adbSerial, 'ADB serial (optional)'),
+        Wrap(children: [action('Start screen', () => tools.startMirror(serial: adbSerial.text.trim()), Icons.play_arrow), action('Stop', tools.stopMirror, Icons.stop)]),
+        const Text('Uses the official scrcpy binary in a separate window, not an embedded Flutter texture. USB debugging must be enabled.')];
+      case 3: return [field(adbSerial, 'ADB serial (optional)'),
+        Wrap(children: [action('Start camera', () => tools.startMirror(serial: adbSerial.text.trim(), camera: true), Icons.videocam), action('Stop', tools.stopMirror, Icons.stop)]),
+        const Text('Camera capture requires supported Android/scrcpy. Virtual webcam integration differs by operating system.')];
+      case 4: return [field(deviceId, 'Paired KDE device ID'), field(filePath, 'Absolute local file path or URL'),
+        action('Share via KDE Connect', () => tools.share(deviceId.text.trim(), filePath.text.trim()), Icons.send),
+        const Text('Only send files to devices you own or trust.')];
+      default: return [const SelectableText('Nexus Hub v0.3 integration prototype.\nUses installed scrcpy (Apache-2.0) and kdeconnect-cli (GPL).\nNo upstream code is copied into this project.\nThe Rust discovery daemon is optional and does not perform pairing.\nCalls, SMS, full feature parity, and in-app embedded video are NOT implemented.')];
+    }
+  }
 }

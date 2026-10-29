@@ -1,41 +1,31 @@
-# Nexus Hub v0.2 — source prototype + engineering audit
+# Nexus Hub v0.3 - upstream integration prototype
 
-**Truthful status:** Rust discovery daemon + Flutter status GUI; it does NOT yet pair with phones, mirror screens, control Android, offer live notifications, messages, calls, mic or camera. No compiled installer included.
+A real, minimal **desktop GUI integration** of the existing `scrcpy` and KDE Connect executables. It adds useful behavior to the previous Rust discovery-only project without importing vendor code or rewriting well-maintained core protocols.
 
-## Development setup
-Requires current stable Rust/Cargo and Flutter SDK. Confirm your OS desktop build prerequisites via Flutter's official install guide. This environment did not contain Rust/Flutter, so compilation was NOT verified here.
+## What works (assuming installed tools)
+- List paired/reachable KDE Connect devices using `kdeconnect-cli --list-available --id-name-only`
+- Request pairing or send ping via official KDE Connect
+- Share a file/URL through KDE Connect
+- Launch/stop official scrcpy screen streaming as an owned child
+- Launch/stop supported scrcpy camera streaming
+- Optional separate Rust discovery daemon with untrusted peer listing
 
-```bash
-python scripts/check_structure.py
-cargo fmt --all -- --check
+These calls are wired into the Flutter UI, not demo buttons. **Not implemented:** embedded video in the window, real native TLS pairing, notifications reading, SMS, virtual camera on Windows, Android companion app, releases, or benchmarked performance.
+
+## Installation
+Install current official `scrcpy` and `kdeconnect` packages compatible with your OS, plus Flutter 3.x and Rust. Ensure commands `scrcpy` and `kdeconnect-cli` are on PATH. In the `ui` directory:
+
+```
+flutter create --platforms=windows,linux,macos .
+flutter pub get
+flutter run -d linux  # on Windows: -d windows
+```
+
+Set up Android USB debugging and authorized ADB on your own device. Open official KDE Connect on phone and desktop for discovery/pairing; accept requests on both ends. `kdeconnect-cli` depends on the KDE Connect daemon and its environment. Only launch one Rust UDP discovery process if you need that separate view:
+
+```
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p nexus-core
 ```
 
-Run GUI in another terminal:
-```bash
-cd ui
-flutter create --platforms=windows,linux,macos .
-flutter pub get
-flutter run -d windows  # or linux / macos
-```
-
-Port UDP 1716 is for discovery, not a completed implementation of KDE Connect. Stop another desktop KDE Connect process if there is a port conflict. `127.0.0.1:8787/status` is a read-only, **unauthenticated developer-only** endpoint — do not port-forward. All LAN identities are spoofable, never a trusted connection.
-
-## Changes since v0.1
-- Split protocol/peers/daemon logic and added peer-store unit tests.
-- Bounded peer store to 128 and TTL to 90 seconds.
-- Bounded concurrent local status requests to 32 with IO deadlines.
-- Removed broad `Access-Control-Allow-Origin: *` response header.
-- Sorted device snapshots for deterministic UI behavior.
-- Ephemeral device ID by default, instead of a shared fixed development identifier.
-
-## Documents
-- `docs/ARCHITECTURE.md` clean layering and future components
-- `docs/THREAT_MODEL.md` risk register at nano/micro/system levels
-- `docs/ROADMAP.md` evidence-driven release gates
-- `docs/REA_WORKFLOW.md` how to use REA as analysis tooling
-
-## Licensing
-Nexus Hub starter code authored for this task. No upstream KDE Connect, scrcpy or REA source copied into this archive. Check obligations before redistributing integrations.
+See `docs/UPSTREAM_INTEGRATION.md` for license review, threat modeling, and next steps. upstream: https://github.com/Genymobile/scrcpy and https://github.com/KDE/kdeconnect-kde
