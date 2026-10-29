@@ -5,15 +5,15 @@
 //! testable and the UI transport-agnostic (hexagonal: IPC is a driving adapter,
 //! scrcpy/kde are driven adapters).
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
 use nexus_adapter_kde::PeerStore;
 use nexus_adapter_scrcpy::{ManagedKind, Supervisor, DEFAULT_KILL_GRACE};
 use nexus_domain::{parse_command, Command, NexusError, ProcessInfo, IPC_VERSION};
 use nexus_ipc::{Request, Response};
 use serde_json::json;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{sync::Mutex, time};
 
 pub struct AppState {
@@ -61,13 +61,15 @@ async fn session_exchange(
     expect_type: &str,
 ) -> Result<(), NexusError> {
     use nexus_adapter_kde::{packet_type, read_packet_bounded, MAX_DATAGRAM};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let stream = time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
         .await
         .map_err(|_| NexusError::NotFound("connect-timeout".into()))?
         .map_err(|_| NexusError::NotFound("unreachable".into()))?;
-    let (mut rd, mut wr) = stream.into_split();
-    let mut buf_reader = tokio::io::BufReader::new(&mut rd);
+    let (rd, mut wr) = stream.into_split();
+    // OwnedReadHalf is AsyncRead but not AsyncBufRead: wrap an owned reader so
+    // the bounded read owns its buffer and stays Send across the timeout.
+    let mut buf_reader = tokio::io::BufReader::new(rd);
     let write = async {
         wr.write_all(packet.as_bytes()).await?;
         wr.write_all(b"\n").await
@@ -77,10 +79,13 @@ async fn session_exchange(
         .map_err(|_| NexusError::Internal)?
         .map_err(|_| NexusError::Internal)?;
     // One bounded read with deadline; anything else is a protocol failure.
-    let raw = time::timeout(Duration::from_secs(5), read_packet_bounded(&mut buf_reader, MAX_DATAGRAM))
-        .await
-        .map_err(|_| NexusError::NotFound("response-timeout".into()))?
-        .map_err(|_| NexusError::InvalidInput)?;
+    let raw = time::timeout(
+        Duration::from_secs(5),
+        read_packet_bounded(&mut buf_reader, MAX_DATAGRAM),
+    )
+    .await
+    .map_err(|_| NexusError::NotFound("response-timeout".into()))?
+    .map_err(|_| NexusError::InvalidInput)?;
     match raw {
         Some(bytes) if packet_type(&bytes).as_deref() == Some(expect_type) => Ok(()),
         Some(_) => Err(NexusError::InvalidInput),
@@ -89,15 +94,25 @@ async fn session_exchange(
 }
 
 /// Look up a validated device id in the peer store; returns (addr, paired).
-async fn peer_addr(state: &AppState, device_id: &str) -> Result<std::net::SocketAddr, NexusError> {
+async fn peer_addr(
+    state: &AppState,
+    device_id: &str,
+) -> Result<(std::net::SocketAddr, bool), NexusError> {
     if !nexus_domain::valid_device_id(device_id) {
         return Err(NexusError::InvalidDeviceId);
     }
     let now = Instant::now();
-    let peers = state.peers.read().await.snapshot(now);
-    let peer = peers.iter().find(|p| p.id == device_id).ok_or(NexusError::NotFound(device_id.into()))?;
+    // Take the write lock: snapshot() performs TTL eviction (mutation) inside the store.
+    let peers = state.peers.write().await.snapshot(now);
+    let peer = peers
+        .iter()
+        .find(|p| p.id == device_id)
+        .ok_or(NexusError::NotFound(device_id.into()))?;
     let ip: std::net::IpAddr = peer.address.parse().map_err(|_| NexusError::Internal)?;
-    Ok(std::net::SocketAddr::new(ip, nexus_adapter_kde::KDE_PORT))
+    Ok((
+        std::net::SocketAddr::new(ip, nexus_adapter_kde::KDE_PORT),
+        peer.paired,
+    ))
 }
 
 async fn handle(state: Arc<AppState>, req: Request) -> Response {
@@ -118,31 +133,44 @@ async fn handle(state: Arc<AppState>, req: Request) -> Response {
                 .supervisor
                 .list()
                 .into_iter()
-                .map(|(handle, kind)| ProcessInfo { handle, kind: kind.to_string(), running: true })
+                .map(|(handle, kind)| ProcessInfo {
+                    handle,
+                    kind: kind.to_string(),
+                    running: true,
+                })
                 .collect();
             Response::success(seq, json!({ "processes": list }))
         }
-        Command::DevicePair { device_id } => {
+        Command::DevicePair { device_id } => match peer_addr(&state, &device_id).await {
+            Ok((addr, _)) => {
+                let pkt = nexus_adapter_kde::pair_packet(1, &state.device_id);
+                match session_exchange(addr, pkt, "kdeconnect.pair").await {
+                    Ok(()) => {
+                        state.peers.write().await.mark_paired(&device_id);
+                        Response::success(seq, json!({ "paired": true }))
+                    }
+                    Err(e) => fail(seq, &e),
+                }
+            }
+            Err(e) => fail(seq, &e),
+        },
+        Command::DevicePing { device_id } => {
             match peer_addr(&state, &device_id).await {
-                Ok(addr) => {
-                    let pkt = nexus_adapter_kde::pair_packet(1, &state.device_id);
-                    match session_exchange(addr, pkt, "kdeconnect.pair").await {
-                        Ok(()) => {
-                            state.peers.write().await.mark_paired(&device_id);
-                            Response::success(seq, json!({ "paired": true }))
-                        }
+                // Least-privilege: pinging a discovered-but-unpaired peer would
+                // inject packets into a stranger's session channel. Refuse until paired.
+                Ok((_, false)) => fail(seq, &NexusError::Unauthorized),
+                Ok((addr, true)) => {
+                    match session_exchange(
+                        addr,
+                        nexus_adapter_kde::ping_packet(1),
+                        "kdeconnect.ping",
+                    )
+                    .await
+                    {
+                        Ok(()) => Response::success(seq, json!({ "reachable": true })),
                         Err(e) => fail(seq, &e),
                     }
                 }
-                Err(e) => fail(seq, &e),
-            }
-        }
-        Command::DevicePing { device_id } => {
-            match peer_addr(&state, &device_id).await {
-                Ok(addr) => match session_exchange(addr, nexus_adapter_kde::ping_packet(1), "kdeconnect.ping").await {
-                    Ok(()) => Response::success(seq, json!({ "reachable": true })),
-                    Err(e) => fail(seq, &e),
-                },
                 Err(e) => fail(seq, &e),
             }
         }
@@ -152,23 +180,40 @@ async fn handle(state: Arc<AppState>, req: Request) -> Response {
                 return fail(seq, &NexusError::InvalidInput);
             }
             match peer_addr(&state, &device_id).await {
-                Ok(_) => Response::success(seq, json!({ "queued": true, "note": "transfer requires v0.6 TLS session" })),
+                Ok((_, false)) => fail(seq, &NexusError::Unauthorized),
+                Ok(_) => Response::success(
+                    seq,
+                    json!({ "queued": true, "note": "transfer requires v0.6 TLS session" }),
+                ),
                 Err(e) => fail(seq, &e),
             }
         }
-        Command::MirrorStart { serial } => match spawn_stream(&state, ManagedKind::ScrcpyMirror, serial, false).await {
-            Ok(handle) => Response::success(seq, json!({ "handle": handle })),
-            Err(e) => fail(seq, &e),
-        },
-        Command::CameraStart { serial } => match spawn_stream(&state, ManagedKind::ScrcpyCamera, serial, true).await {
-            Ok(handle) => Response::success(seq, json!({ "handle": handle })),
-            Err(e) => fail(seq, &e),
-        },
+        Command::MirrorStart { serial } => {
+            match spawn_stream(&state, ManagedKind::ScrcpyMirror, serial, false).await {
+                Ok(handle) => Response::success(seq, json!({ "handle": handle })),
+                Err(e) => fail(seq, &e),
+            }
+        }
+        Command::CameraStart { serial } => {
+            match spawn_stream(&state, ManagedKind::ScrcpyCamera, serial, true).await {
+                Ok(handle) => Response::success(seq, json!({ "handle": handle })),
+                Err(e) => fail(seq, &e),
+            }
+        }
+
         Command::ProcessStop { handle } => {
+            // Explicit existence check: an unknown/stale handle is a typed error,
+            // NOT a silent success. The UI must be able to distinguish "stopped"
+            // from "was already gone / never existed" (micro-level state honesty).
+            if !state.supervisor.exists(handle) {
+                return fail(seq, &NexusError::UnknownHandle);
+            }
             // stop() is race-safe by construction (channel-based termination);
             // additionally bound it so a wedged reaper can never wedge the handler.
+            // Outer bound must EXCEED the inner grace, otherwise a normal
+            // SIGTERM->SIGKILL escalation (~grace) gets misreported as failure.
             let confirmed = time::timeout(
-                DEFAULT_KILL_GRACE + Duration::from_secs(2),
+                DEFAULT_KILL_GRACE * 2 + Duration::from_secs(2),
                 state.supervisor.stop(handle, DEFAULT_KILL_GRACE),
             )
             .await
@@ -219,13 +264,17 @@ async fn spawn_stream(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    let child = cmd.spawn().map_err(|e| NexusError::SpawnFailed(e.kind().to_string()))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| NexusError::SpawnFailed(e.kind().to_string()))?;
     Ok(state.supervisor.adopt(kind, child))
 }
 
 /// Locate an executable on PATH without spawning a shell (injection-free preflight).
 fn binary_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else { return false };
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
     let exe_names: &[&str] = if cfg!(windows) {
         &[name, &format!("{name}.exe")]
     } else {
@@ -249,7 +298,9 @@ mod tests {
 
     async fn serve(state: Arc<AppState>) -> std::net::SocketAddr {
         let token = "test-token";
-        let server = nexus_ipc::IpcServer::bind(token.to_string(), build_handler(state)).await.unwrap();
+        let server = nexus_ipc::IpcServer::bind(token.to_string(), build_handler(state))
+            .await
+            .unwrap();
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move { server.run().await });
         addr
@@ -260,7 +311,10 @@ mod tests {
         let state = AppState::new();
         let addr = serve(state).await;
         let client = IpcClient::connect(addr, "test-token").await.unwrap();
-        let resp = client.call("ping", serde_json::Value::Null, 1).await.unwrap();
+        let resp = client
+            .call("ping", serde_json::Value::Null, 1)
+            .await
+            .unwrap();
         assert!(resp.ok);
         assert_eq!(resp.data.unwrap()["pong"], true);
     }
@@ -270,7 +324,10 @@ mod tests {
         let state = AppState::new();
         let addr = serve(state).await;
         let client = IpcClient::connect(addr, "test-token").await.unwrap();
-        let resp = client.call("devices_list", serde_json::Value::Null, 2).await.unwrap();
+        let resp = client
+            .call("devices_list", serde_json::Value::Null, 2)
+            .await
+            .unwrap();
         assert!(resp.ok);
         assert_eq!(resp.data.unwrap()["devices"].as_array().unwrap().len(), 0);
     }
@@ -285,7 +342,30 @@ mod tests {
             .await
             .unwrap();
         assert!(!resp.ok);
+        // Validation firewall is environment-independent: a malformed serial must
+        // yield the typed validation error whether or not scrcpy is installed.
+        // (The old assertion of "invalid-device-id" only passed on machines that
+        // happened to have scrcpy on PATH — an accidental test.)
         assert_eq!(resp.error.as_deref(), Some("invalid-device-id"));
+    }
+
+    #[tokio::test]
+    async fn mirror_start_reports_tool_unavailable_when_absent() {
+        // On a host WITHOUT scrcpy, a well-formed serial must surface the typed
+        // preflight error instead of an opaque spawn OS error. Skip gracefully on
+        // hosts where the tool exists so the test is portable across CI images.
+        if binary_on_path("scrcpy") {
+            return;
+        }
+        let state = AppState::new();
+        let addr = serve(state).await;
+        let client = IpcClient::connect(addr, "test-token").await.unwrap();
+        let resp = client
+            .call("mirror_start", json!({ "serial": "emulator-5554" }), 6)
+            .await
+            .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("tool-unavailable"));
     }
 
     #[tokio::test]
@@ -293,7 +373,10 @@ mod tests {
         let state = AppState::new();
         let addr = serve(state).await;
         let client = IpcClient::connect(addr, "test-token").await.unwrap();
-        let resp = client.call("rm_rf", serde_json::Value::Null, 4).await.unwrap();
+        let resp = client
+            .call("rm_rf", serde_json::Value::Null, 4)
+            .await
+            .unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.as_deref(), Some("invalid-input"));
     }
@@ -303,8 +386,14 @@ mod tests {
         let state = AppState::new();
         let addr = serve(state).await;
         let client = IpcClient::connect(addr, "test-token").await.unwrap();
-        let resp = client.call("process_stop", json!({ "handle": 9999 }), 5).await.unwrap();
-        assert!(resp.ok);
-        assert_eq!(resp.data.unwrap()["stopped"], true);
+        // Contract (v0.4 honesty rule): stopping a handle that never existed is a
+        // typed error, NOT a silent success — the UI must distinguish "stopped"
+        // from "stale/unknown session id".
+        let resp = client
+            .call("process_stop", json!({ "handle": 9999 }), 5)
+            .await
+            .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("unknown-handle"));
     }
 }

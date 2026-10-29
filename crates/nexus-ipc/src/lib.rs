@@ -5,17 +5,17 @@
 //! - Every connection must present the shared session token (constant-time compare)
 //!   before any command is accepted. The token comes from the OS CSPRNG and lives in
 //!   a mode-0600 file under a SINGLE canonical path shared with the Flutter client:
-//!       $XDG_RUNTIME_DIR/nexus-hub/ipc-token        (unix)
-//!       %LOCALAPPDATA%\nexus-hub\ipc-token          (windows)
+//!     - `$XDG_RUNTIME_DIR/nexus-hub/ipc-token` (unix)
+//!     - `%LOCALAPPDATA%\nexus-hub\ipc-token` (windows)
 //! - Requests are length-prefixed JSON frames with HARD bounds enforced *before*
 //!   allocation (read_exact into fixed stack chunk; never trust the announced length).
 //! - Read deadlines on every socket operation; idle connections are reclaimed.
 //! - Concurrency across connections is bounded by a semaphore so a client flood
 //!   cannot exhaust task slots.
 
-use std::{io, sync::Arc, time::Duration};
 use nexus_domain::IPC_VERSION;
 use serde::{Deserialize, Serialize};
+use std::{io, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -57,10 +57,20 @@ pub struct Response {
 
 impl Response {
     pub fn success(seq: u64, data: serde_json::Value) -> Self {
-        Self { seq, ok: true, data: Some(data), error: None }
+        Self {
+            seq,
+            ok: true,
+            data: Some(data),
+            error: None,
+        }
     }
     pub fn failure(seq: u64, error: impl Into<String>) -> Self {
-        Self { seq, ok: false, data: None, error: Some(error.into()) }
+        Self {
+            seq,
+            ok: false,
+            data: None,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -73,7 +83,8 @@ impl Response {
 /// Windows: RtlGenRandom/BCrypt fallback via SystemFunction036.
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    fill_entropy(&mut bytes).expect("no OS entropy source available; refusing to generate IPC token");
+    fill_entropy(&mut bytes)
+        .expect("no OS entropy source available; refusing to generate IPC token");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -111,7 +122,10 @@ fn fill_entropy(buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 fn fill_entropy(_buf: &mut [u8]) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "no entropy binding for this platform"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no entropy binding for this platform",
+    ))
 }
 
 /// Canonical directory holding the IPC endpoint descriptor (single source of truth:
@@ -166,7 +180,10 @@ fn enforce_dir_permissions(path: &std::path::Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
     if mode != 0o700 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "runtime dir perms not 0700"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime dir perms not 0700",
+        ));
     }
     Ok(())
 }
@@ -177,7 +194,10 @@ fn enforce_file_permissions(path: &std::path::Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
     if mode != 0o600 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "token file perms not 0600"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "token file perms not 0600",
+        ));
     }
     Ok(())
 }
@@ -234,7 +254,10 @@ struct Bucket {
 
 impl Bucket {
     fn new() -> Self {
-        Self { tokens: RATE_BURST as f64, last: tokio::time::Instant::now() }
+        Self {
+            tokens: RATE_BURST as f64,
+            last: tokio::time::Instant::now(),
+        }
     }
     fn allow(&mut self) -> bool {
         let now = tokio::time::Instant::now();
@@ -276,7 +299,12 @@ impl IpcServer {
     /// is published through the endpoint descriptor file).
     pub async fn bind(token: String, handler: Handler) -> io::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-        Ok(Self { listener, token: Arc::new(token), handler, slots: Arc::new(Semaphore::new(8)) })
+        Ok(Self {
+            listener,
+            token: Arc::new(token),
+            handler,
+            slots: Arc::new(Semaphore::new(8)),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
@@ -338,7 +366,10 @@ async fn serve_conn(mut stream: TcpStream, token: Arc<String>, handler: Handler)
     let mut body: Vec<u8> = Vec::with_capacity(4096);
     loop {
         // 4-byte big-endian length prefix with idle deadline.
-        if time::timeout(HEADER_TIMEOUT, stream.read_exact(&mut len_buf)).await.is_err() {
+        if time::timeout(HEADER_TIMEOUT, stream.read_exact(&mut len_buf))
+            .await
+            .is_err()
+        {
             return Ok(()); // idle timeout: reclaim the socket
         }
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -353,7 +384,10 @@ async fn serve_conn(mut stream: TcpStream, token: Arc<String>, handler: Handler)
         }
         // Bound-checked body read with a strict deadline (allocation capped at MAX_FRAME).
         body.resize(len, 0u8);
-        if time::timeout(BODY_TIMEOUT, stream.read_exact(&mut body)).await.is_err() {
+        if time::timeout(BODY_TIMEOUT, stream.read_exact(&mut body))
+            .await
+            .is_err()
+        {
             return Ok(());
         }
         let req: Request = match serde_json::from_slice(&body) {
@@ -406,25 +440,42 @@ impl IpcClient {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect deadline"))??;
         stream.set_nodelay(true)?;
-        Ok(Self { stream: Mutex::new(stream), token: token.to_string() })
+        Ok(Self {
+            stream: Mutex::new(stream),
+            token: token.to_string(),
+        })
     }
 
     /// Connect using the published endpoint descriptor + token files.
     pub async fn connect_default() -> io::Result<Self> {
-        let token = tokio::fs::read_to_string(token_path()?).await?.trim().to_string();
-        let ep = tokio::fs::read_to_string(endpoint_path()?).await?.trim().to_string();
+        let token = tokio::fs::read_to_string(token_path()?)
+            .await?
+            .trim()
+            .to_string();
+        let ep = tokio::fs::read_to_string(endpoint_path()?)
+            .await?
+            .trim()
+            .to_string();
         let addr: std::net::SocketAddr = ep.parse().map_err(io::Error::other)?;
         Self::connect(addr, &token).await
     }
 
-    pub async fn call(&self, method: &str, params: serde_json::Value, seq: u64) -> io::Result<Response> {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        seq: u64,
+    ) -> io::Result<Response> {
         let req = serde_json::to_vec(&serde_json::json!({
             "token": self.token, "seq": seq, "method": method, "params": params,
             "version": IPC_VERSION
         }))
         .map_err(io::Error::other)?;
         if req.len() > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "request too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request too large",
+            ));
         }
         let mut guard = self.stream.lock().await;
         guard.write_all(&(req.len() as u32).to_be_bytes()).await?;
@@ -458,7 +509,9 @@ mod tests {
     }
 
     async fn spawn_server(token: &str) -> std::net::SocketAddr {
-        let server = IpcServer::bind(token.to_string(), echo_handler()).await.expect("bind");
+        let server = IpcServer::bind(token.to_string(), echo_handler())
+            .await
+            .expect("bind");
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move { server.run().await });
         addr
@@ -486,7 +539,10 @@ mod tests {
         let token = generate_token();
         let addr = spawn_server(&token).await;
         let client = IpcClient::connect(addr, &token).await.unwrap();
-        let resp = client.call("echo", serde_json::json!({"hello": "world"}), 7).await.unwrap();
+        let resp = client
+            .call("echo", serde_json::json!({"hello": "world"}), 7)
+            .await
+            .unwrap();
         assert!(resp.ok);
         assert_eq!(resp.seq, 7);
         assert_eq!(resp.data.unwrap()["hello"], "world");
@@ -502,9 +558,14 @@ mod tests {
         let token = generate_token();
         let addr = spawn_server(&token).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&((MAX_FRAME as u32 + 10)).to_be_bytes()).await.unwrap();
+        stream
+            .write_all(&(MAX_FRAME as u32 + 10).to_be_bytes())
+            .await
+            .unwrap();
         let mut buf = [0u8; 8];
-        let n = time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await.expect("timeout");
+        let n = time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+            .await
+            .expect("timeout");
         assert_eq!(n.unwrap_or(0), 0, "expected immediate close");
     }
 
@@ -514,12 +575,19 @@ mod tests {
         let token = generate_token();
         let addr = spawn_server(&token).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&(MAX_FRAME as u32).to_be_bytes()).await.unwrap();
+        stream
+            .write_all(&(MAX_FRAME as u32).to_be_bytes())
+            .await
+            .unwrap();
         let mut buf = [0u8; 8];
         // Server should close within ~BODY_TIMEOUT + slack; test uses generous outer bound.
         let res = time::timeout(BODY_TIMEOUT + Duration::from_secs(2), stream.read(&mut buf)).await;
         assert!(res.is_ok(), "server hung on truncated body");
-        assert_eq!(res.unwrap().unwrap_or(0), 0, "expected close after body deadline");
+        assert_eq!(
+            res.unwrap().unwrap_or(0),
+            0,
+            "expected close after body deadline"
+        );
     }
 
     #[tokio::test]
@@ -527,7 +595,10 @@ mod tests {
         let token = generate_token();
         let addr = spawn_server(&token).await;
         let client = IpcClient::connect(addr, &token).await.unwrap();
-        let resp = client.call("nope", serde_json::Value::Null, 3).await.unwrap();
+        let resp = client
+            .call("nope", serde_json::Value::Null, 3)
+            .await
+            .unwrap();
         assert!(!resp.ok);
         assert!(resp.error.unwrap().starts_with("unknown-method"));
     }
@@ -541,7 +612,10 @@ mod tests {
         write_credentials(&token, 12345).expect("write creds");
         let p = token_path().unwrap();
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), token);
         remove_credentials();
         std::fs::remove_dir_all(&dir).ok();

@@ -1,8 +1,7 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'backend.dart';
+import 'ipc_client.dart';
 
 void main() => runApp(const NexusApp());
 class NexusApp extends StatelessWidget {
@@ -23,6 +22,7 @@ class Dashboard extends StatefulWidget {
 }
 class _DashboardState extends State<Dashboard> {
   final tools = NexusTools();
+  final ipc = NexusIpcClient();
   final deviceId = TextEditingController();
   final adbSerial = TextEditingController();
   final filePath = TextEditingController();

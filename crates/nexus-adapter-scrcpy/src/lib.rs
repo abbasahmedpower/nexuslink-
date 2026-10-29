@@ -112,11 +112,22 @@ impl Supervisor {
         self.list().iter().any(|(_, k)| *k == kind)
     }
 
+    /// True if a slot with this handle exists (running or mid-exit). Used by the
+    /// application layer to distinguish "stopped" from "unknown/stale handle"
+    /// instead of silently returning success for handles that never existed.
+    pub fn exists(&self, handle: u64) -> bool {
+        self.inner.lock().unwrap().iter().any(|(h, _)| *h == handle)
+    }
+
     /// Adopt an already-spawned child under supervision. The child moves into a
     /// dedicated reaper task which owns it until exit — nothing else can touch it.
     pub fn adopt(self: &Arc<Self>, kind: ManagedKind, child: Child) -> u64 {
         let handle = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let session = Arc::new(Session { kind, running: AtomicBool::new(true), done: tokio::sync::Notify::new() });
+        let session = Arc::new(Session {
+            kind,
+            running: AtomicBool::new(true),
+            done: tokio::sync::Notify::new(),
+        });
         self.inner.lock().unwrap().push((handle, session.clone()));
         let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<Control>();
         self.controls.lock().unwrap().push((handle, ctl_tx));
@@ -152,7 +163,11 @@ impl Supervisor {
                 let mut g = me.controls.lock().unwrap();
                 g.retain(|(h, _)| *h != handle);
             }
-            let event = ExitEvent { handle, kind, status: status.map(|s| s.to_string()) };
+            let event = ExitEvent {
+                handle,
+                kind,
+                status: status.map(|s| s.to_string()),
+            };
             // Bounded queue, drop-newest: the reaper must never block and memory must
             // never grow. Lost events are still observable via `list()`/state queries.
             if let Err(e) = me.tx.try_send(event) {
@@ -168,13 +183,25 @@ impl Supervisor {
     pub async fn stop(&self, handle: u64, grace: Duration) -> bool {
         // Register interest in the terminal notification BEFORE signalling, so a
         // fast exit cannot slip between notify and wait (classic lost-wakeup race).
-        let session = self.inner.lock().unwrap().iter().find(|(h, _)| *h == handle).map(|(_, s)| s.clone());
+        let session = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .map(|(_, s)| s.clone());
         let Some(session) = session else { return true }; // unknown handle: already gone
         let notified = session.done.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let sender = self.controls.lock().unwrap().iter().find(|(h, _)| *h == handle).map(|(_, c)| c.clone());
+        let sender = self
+            .controls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .map(|(_, c)| c.clone());
         if let Some(c) = sender {
             let _ = c.send(Control::Terminate);
         }
@@ -190,7 +217,13 @@ impl Supervisor {
     /// Stop everything (shutdown path). Remaining children are terminated via
     /// their control channels; kill_on_drop is belt-and-suspenders.
     pub fn stop_all(&self) {
-        let senders: Vec<_> = self.controls.lock().unwrap().iter().map(|(_, c)| c.clone()).collect();
+        let senders: Vec<_> = self
+            .controls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
         for c in senders {
             let _ = c.send(Control::Terminate);
         }
@@ -227,7 +260,10 @@ mod tests {
         let sup = Supervisor::new();
         let mut rx = sup.subscribe().expect("first subscriber");
         let h = sup.adopt(ManagedKind::KdeCli, spawn_dummy(0.05));
-        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("event").expect("channel open");
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event")
+            .expect("channel open");
         assert_eq!(ev.handle, h);
         assert!(ev.status.is_some());
         assert_eq!(sup.count(), 0);
@@ -272,11 +308,19 @@ mod tests {
         // Micro-level scenario: process dies outside our control (adb crash etc.).
         let sup = Supervisor::new();
         let mut rx = sup.subscribe().expect("first subscriber");
-        let child = Command::new("sh").arg("-c").arg("sleep 30").kill_on_drop(true).spawn().expect("spawn");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn");
         let pid = child.id().expect("pid");
         let h = sup.adopt(ManagedKind::ScrcpyMirror, child);
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("event").expect("open");
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event")
+            .expect("open");
         assert_eq!(ev.handle, h);
         assert!(!sup.is_running(ManagedKind::ScrcpyMirror));
     }
@@ -313,7 +357,11 @@ mod tests {
         let _rx = sup.subscribe();
         let h = sup.adopt(ManagedKind::ScrcpyMirror, spawn_dummy(60.0));
         // Grace (2s) > pipe-drain latency; outer timeout (5s) still bounds the test.
-        let ok = tokio::time::timeout(Duration::from_secs(5), sup.stop(h, Duration::from_millis(2000))).await;
+        let ok = tokio::time::timeout(
+            Duration::from_secs(5),
+            sup.stop(h, Duration::from_millis(2000)),
+        )
+        .await;
         assert!(ok.is_ok(), "stop deadlocked");
         assert!(ok.unwrap());
         assert_eq!(sup.count(), 0);

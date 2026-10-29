@@ -28,6 +28,9 @@ pub enum NexusError {
     SpawnFailed(String),
     #[error("rate-limited")]
     RateLimited,
+    /// Unknown process handle requested an operation (e.g. stop after exit).
+    #[error("unknown-handle")]
+    UnknownHandle,
     #[error("internal")]
     Internal,
 }
@@ -44,6 +47,7 @@ impl NexusError {
             Self::ToolUnavailable(_) => "tool-unavailable",
             Self::SpawnFailed(_) => "spawn-failed",
             Self::RateLimited => "rate-limited",
+            Self::UnknownHandle => "unknown-handle",
             Self::Internal => "internal",
         }
     }
@@ -55,6 +59,9 @@ impl NexusError {
 pub fn valid_device_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
+        // Option-smuggling firewall: an id that starts with '-' would be parsed
+        // as a CLI switch by scrcpy/adb even though argv is fixed and shell-free.
+        && !id.starts_with('-')
         && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
 }
 
@@ -116,7 +123,19 @@ pub struct DeviceInfo {
 /// Parse and validate a command coming over IPC. Returns a typed error on any
 /// malformed or out-of-contract input; never panics on untrusted data.
 pub fn parse_command(json: &serde_json::Value) -> Result<Command, NexusError> {
-    serde_json::from_value::<Command>(json.clone()).map_err(|_| NexusError::InvalidInput)
+    // Wire contract: {"method": "...", "params": {...}} — params is flattened
+    // into the struct variants by serde. (Previously this fed the raw envelope
+    // into from_value, so every parameterized command failed to deserialize as
+    // InvalidInput while zero-arg commands like ping accidentally worked.)
+    let mut envelope = json.as_object().cloned().ok_or(NexusError::InvalidInput)?;
+    let params = envelope.remove("params").unwrap_or(serde_json::Value::Null);
+    if let Some(map) = params.as_object() {
+        for (k, v) in map {
+            envelope.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value::<Command>(serde_json::Value::Object(envelope))
+        .map_err(|_| NexusError::InvalidInput)
 }
 
 #[cfg(test)]
@@ -125,7 +144,9 @@ mod tests {
 
     #[test]
     fn roundtrip_commands() {
-        let c = Command::MirrorStart { serial: Some("emulator-5554".into()) };
+        let c = Command::MirrorStart {
+            serial: Some("emulator-5554".into()),
+        };
         let j = serde_json::to_value(&c).unwrap();
         assert_eq!(j["method"], "mirror_start");
         let back = parse_command(&j).unwrap();
@@ -141,7 +162,9 @@ mod tests {
     #[test]
     fn rejects_unknown_and_malformed() {
         assert!(parse_command(&serde_json::json!({ "method": "rm_rf" })).is_err());
-        assert!(parse_command(&serde_json::json!({ "method": "process_stop", "handle": "x" })).is_err());
+        assert!(
+            parse_command(&serde_json::json!({ "method": "process_stop", "handle": "x" })).is_err()
+        );
         assert!(parse_command(&serde_json::json!("just a string")).is_err());
     }
 

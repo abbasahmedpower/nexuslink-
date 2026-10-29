@@ -11,6 +11,9 @@
 //!
 //! All business logic lives in nexus-application; this binary only wires things.
 
+use nexus_adapter_kde::{parse_identity, KDE_PORT, MAX_DATAGRAM, PROTOCOL_VERSION};
+use nexus_application::AppState;
+use serde_json::json;
 use std::{
     env,
     error::Error,
@@ -18,14 +21,14 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use nexus_adapter_kde::{parse_identity, KDE_PORT, MAX_DATAGRAM, PROTOCOL_VERSION};
-use nexus_application::AppState;
-use serde_json::json;
 use tokio::{net::UdpSocket, sync::broadcast, time};
 use tracing::{info, warn};
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[tokio::main]
@@ -41,8 +44,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = AppState::new();
 
     // Event bus bridging supervisor exits to any interested IPC subscriber.
-    let (event_tx, mut event_rx0): (broadcast::Sender<serde_json::Value>, broadcast::Receiver<serde_json::Value>) =
-        broadcast::channel(64);
+    let (event_tx, mut event_rx0): (
+        broadcast::Sender<serde_json::Value>,
+        broadcast::Receiver<serde_json::Value>,
+    ) = broadcast::channel(64);
     {
         let mut rx = state.supervisor.subscribe().expect("first subscriber");
         let tx = event_tx.clone();
@@ -77,7 +82,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Ok((n, source)) => {
                         if let Some(identity) = parse_identity(&buf[..n]) {
                             if identity.device_id != own_id {
-                                peers.write().await.observe(identity, source.ip(), Instant::now());
+                                peers
+                                    .write()
+                                    .await
+                                    .observe(identity, source.ip(), Instant::now());
                             }
                         }
                     }
@@ -101,7 +109,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "incomingCapabilities": [], "outgoingCapabilities": []
                     }})
                 );
-                if let Err(e) = socket.send_to(payload.as_bytes(), (Ipv4Addr::BROADCAST, KDE_PORT)).await {
+                if let Err(e) = socket
+                    .send_to(payload.as_bytes(), (Ipv4Addr::BROADCAST, KDE_PORT))
+                    .await
+                {
                     warn!("Broadcast failed: {e}");
                 }
             }
