@@ -1,11 +1,15 @@
 [package]
 name = "nexus-core"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync", "io-util", "process", "rt"] }
-serde = { version = "1", features = ["derive"] }
+nexus-domain = { path = "../nexus-domain" }
+nexus-application = { path = "../nexus-application" }
+nexus-ipc = { path = "../nexus-ipc" }
+nexus-adapter-kde = { path = "../nexus-adapter-kde" }
+nexus-adapter-scrcpy = { path = "../nexus-adapter-scrcpy" }
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync", "io-util", "process", "rt"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

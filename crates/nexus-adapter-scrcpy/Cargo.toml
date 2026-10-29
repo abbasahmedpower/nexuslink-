@@ -1,0 +1,13 @@
+[package]
+name = "nexus-adapter-scrcpy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "io-util", "rt"] }
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
