@@ -1,134 +1,148 @@
-//! Nexus Hub core daemon (v0.4 — thin composition root).
+//! Nexus Hub core daemon (v0.4 — clean composition root)
 //!
-//! Startup order (shutdown is strictly reverse):
-//! 1. IPC session token from the OS CSPRNG — refuse to run without real entropy.
-//! 2. Passive KDE-Connect-compatible discovery engine (UDP 1716) + identity broadcast.
-//! 3. Process Supervisor (nexus-adapter-scrcpy) — sole owner of every child we launch.
-//! 4. Authenticated, loopback-only IPC server (nexus-ipc) for the Flutter UI and CLI.
-//!    The endpoint + token are published to $XDG_RUNTIME_DIR/nexus-hub/ (unix) or
-//!    %LOCALAPPDATA%\nexus-hub\ (windows) with owner-only permissions, so the UI
-//!    discovers the *actual* ephemeral port instead of guessing a fixed one.
-//!
-//! All business logic lives in nexus-application; this binary only wires things.
+//! Startup order (shutdown is the reverse):
+//! 1. Initialize adapters (scrcpy + kdeconnect-cli)
+//! 2. Build HubApplication
+//! 3. Create per-user authenticated IPC server
+//! 4. Start optional passive discovery (UDP 1716) — untrusted by design
+//! 5. Wait for Ctrl+C then shut down cleanly
 
+use nexus_adapter_kde::CliKdeAdapter;
+use nexus_adapter_scrcpy::ProcessScrcpySupervisor;
+use nexus_application::HubApplication;
+use nexus_ipc::{AuthConfig, IpcServer, IPC_TCP_FALLBACK_PORT};
 use std::{
     env,
     error::Error,
     net::Ipv4Addr,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use nexus_adapter_kde::{parse_identity, KDE_PORT, MAX_DATAGRAM, PROTOCOL_VERSION};
-use nexus_application::AppState;
-use serde_json::json;
-use tokio::{net::UdpSocket, sync::broadcast, time};
-use tracing::{info, warn};
+use tokio::{net::UdpSocket, time};
+use tracing::{error, info, warn};
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize logging
     tracing_subscriber::fmt::init();
+    info!("Nexus Hub v0.4 starting...");
 
-    // 1. Token: fail closed if the OS CSPRNG is unavailable.
-    let token = nexus_ipc::generate_token();
-    let id = env::var("NEXUS_DEVICE_ID")
-        .unwrap_or_else(|_| format!("nexus-session-{}-{}", std::process::id(), now_ms()));
-    let name = env::var("NEXUS_DEVICE_NAME").unwrap_or_else(|_| "Nexus Desktop".into());
+    // ------------------------------------------------------------------
+    // 1. Device identity (used only for discovery broadcast)
+    // ------------------------------------------------------------------
+    let device_id = env::var("NEXUS_DEVICE_ID").unwrap_or_else(|_| {
+        format!("nexus-session-{}-{}", std::process::id(), now_ms())
+    });
+    let device_name =
+        env::var("NEXUS_DEVICE_NAME").unwrap_or_else(|_| "Nexus Desktop".into());
 
-    let state = AppState::new();
+    // ------------------------------------------------------------------
+    // 2. Initialize adapters (official tools)
+    // ------------------------------------------------------------------
+    let kde_path =
+        env::var("NEXUS_KDECONNECT_PATH").unwrap_or_else(|_| "kdeconnect-cli".into());
+    let scrcpy_path =
+        env::var("NEXUS_SCRCPY_PATH").unwrap_or_else(|_| "scrcpy".into());
 
-    // Event bus bridging supervisor exits to any interested IPC subscriber.
-    let (event_tx, mut event_rx0): (broadcast::Sender<serde_json::Value>, broadcast::Receiver<serde_json::Value>) =
-        broadcast::channel(64);
-    {
-        let mut rx = state.supervisor.subscribe().expect("first subscriber");
-        let tx = event_tx.clone();
+    let kde_adapter = Arc::new(CliKdeAdapter::new(kde_path));
+    let scrcpy_supervisor = Arc::new(ProcessScrcpySupervisor::new(scrcpy_path));
+
+    // ------------------------------------------------------------------
+    // 3. Build application layer
+    // ------------------------------------------------------------------
+    let app = HubApplication::new(kde_adapter, scrcpy_supervisor);
+
+    // ------------------------------------------------------------------
+    // 4. Authenticated per-user IPC server
+    // ------------------------------------------------------------------
+    let auth = AuthConfig::init_per_user()?;
+    info!("Auth token written to {}", auth.token_path.display());
+
+    let ipc_server = Arc::new(IpcServer::new(app, auth));
+
+    let ipc_task = {
+        let server = ipc_server.clone();
         tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                let payload = json!({
-                    "event": "process-exit",
-                    "handle": ev.handle,
-                    "kind": ev.kind.to_string(),
-                    "status": ev.status,
-                });
-                let _ = tx.send(payload); // drop when no subscribers: bounded by design
-            }
-        });
-    }
-    // Keep the initial receiver alive so the bus has at least one listener and
-    // `send` never early-fails before real subscribers attach (v0.5 will expose
-    // events over IPC via subscribe semantics).
-    let _ = &mut event_rx0;
-
-    // 2. Discovery (passive, untrusted peers).
-    let udp = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, KDE_PORT)).await?);
-    udp.set_broadcast(true)?;
-    let discovery = {
-        let socket = udp.clone();
-        let peers = state.peers.clone();
-        let own_id = id.clone();
-        tokio::spawn(async move {
-            let mut buf = [0_u8; MAX_DATAGRAM];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, source)) => {
-                        if let Some(identity) = parse_identity(&buf[..n]) {
-                            if identity.device_id != own_id {
-                                peers.write().await.observe(identity, source.ip(), Instant::now());
-                            }
-                        }
-                    }
-                    Err(e) => warn!("Discovery receive error: {e}"),
-                }
+            if let Err(e) = server.run_tcp_loopback(IPC_TCP_FALLBACK_PORT).await {
+                error!("IPC server error: {}", e);
             }
         })
     };
-    let broadcaster = {
-        let socket = udp.clone();
-        tokio::spawn(async move {
+
+    // ------------------------------------------------------------------
+    // 5. Optional passive discovery (UDP 1716) — untrusted by design
+    // ------------------------------------------------------------------
+    let udp = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 1716)).await {
+        Ok(socket) => {
+            let _ = socket.set_broadcast(true);
+            Some(Arc::new(socket))
+        }
+        Err(e) => {
+            warn!("Could not bind UDP 1716 for discovery: {e}");
+            None
+        }
+    };
+
+    let broadcaster = if let Some(socket) = udp.clone() {
+        let id = device_id.clone();
+        let name = device_name.clone();
+        Some(tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_secs(10));
             loop {
                 ticker.tick().await;
                 let payload = format!(
                     "{}\n",
-                    json!({"id": now_ms(), "type":"kdeconnect.identity", "body": {
-                        "deviceId": id, "deviceName": name, "deviceType": "laptop",
-                        "protocolVersion": PROTOCOL_VERSION,
-                        "tcpPort": KDE_PORT,
-                        "incomingCapabilities": [], "outgoingCapabilities": []
-                    }})
+                    serde_json::json!({
+                        "id": now_ms(),
+                        "type": "kdeconnect.identity",
+                        "body": {
+                            "deviceId": id,
+                            "deviceName": name,
+                            "deviceType": "laptop",
+                            "protocolVersion": 7,
+                            "tcpPort": 1716,
+                            "incomingCapabilities": [],
+                            "outgoingCapabilities": []
+                        }
+                    })
                 );
-                if let Err(e) = socket.send_to(payload.as_bytes(), (Ipv4Addr::BROADCAST, KDE_PORT)).await {
-                    warn!("Broadcast failed: {e}");
+                if let Err(e) = socket
+                    .send_to(payload.as_bytes(), (Ipv4Addr::BROADCAST, 1716))
+                    .await
+                {
+                    warn!("Discovery broadcast failed: {e}");
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
 
-    // 3+4. Authenticated IPC on an ephemeral loopback port, credentials published.
-    let handler = nexus_application::build_handler(state.clone());
-    let server = nexus_ipc::IpcServer::bind(token.clone(), handler).await?;
-    let addr = server.local_addr()?;
-    nexus_ipc::write_credentials(&token, addr.port())?;
-    info!("Authenticated IPC listening on {addr} (loopback only); credentials published");
-    let ipc_task = tokio::spawn(async move { server.run().await });
-
-    // Orderly shutdown: fatal IPC outage OR ctrl-c both take the same path.
-    tokio::select! {
-        res = ipc_task => {
-            if let Err(e) = res {
-                warn!("IPC accept loop failed: {e}; shutting down");
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {}
+    info!("Nexus Hub is ready");
+    info!("  • Authenticated IPC on 127.0.0.1:{}", IPC_TCP_FALLBACK_PORT);
+    if broadcaster.is_some() {
+        info!("  • Passive discovery broadcasting on UDP 1716");
     }
-    info!("Shutdown requested: stopping in reverse startup order");
-    state.supervisor.stop_all();
-    broadcaster.abort();
-    discovery.abort();
-    nexus_ipc::remove_credentials();
+
+    // ------------------------------------------------------------------
+    // 6. Wait for shutdown signal
+    // ------------------------------------------------------------------
+    tokio::signal::ctrl_c().await?;
+    info!("Shutdown requested...");
+
+    // Clean shutdown (reverse order)
+    if let Some(task) = broadcaster {
+        task.abort();
+    }
+    ipc_task.abort();
+
+    info!("Shutdown complete");
     Ok(())
 }

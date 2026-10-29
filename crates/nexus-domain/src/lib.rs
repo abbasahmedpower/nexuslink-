@@ -1,159 +1,152 @@
-//! nexus-domain — core data models and typed errors.
-//!
-//! This crate has NO async runtime, NO I/O, and NO dependencies on any adapter.
-//! Everything here is plain data + validation, which keeps the domain unit-testable
-//! in isolation (micro-level: service boundaries are enforced by the dependency graph).
-
 use serde::{Deserialize, Serialize};
 
-pub const IPC_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const MAX_IPC_FRAME_SIZE: usize = 65536; // 64 KiB
+pub const MAX_OUTPUT_CAPTURE_SIZE: usize = 12000;
 
-/// Typed, structured error surface shared across crates. Adapters map their
-/// internal failures into these variants so clients never parse English strings.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum NexusError {
-    #[error("invalid-input")]
-    InvalidInput,
-    #[error("invalid-device-id")]
-    InvalidDeviceId,
-    #[error("unauthorized")]
-    Unauthorized,
-    #[error("not-found:{0}")]
-    NotFound(String),
-    #[error("already-running:{0}")]
-    AlreadyRunning(String),
-    #[error("tool-unavailable:{0}")]
-    ToolUnavailable(String),
-    #[error("spawn-failed:{0}")]
-    SpawnFailed(String),
-    #[error("rate-limited")]
-    RateLimited,
-    #[error("internal")]
-    Internal,
+/// Validates device IDs / serials to prevent path traversal, switch injection, or command injection.
+/// Allowed: 1..=128 chars of [A-Za-z0-9_.:-]
+/// Rejects anything starting with '-' to prevent CLI switch confusion.
+pub fn is_valid_device_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 128 {
+        return false;
+    }
+    if id.starts_with('-') {
+        return false;
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':' || c == '-')
 }
 
-impl NexusError {
-    /// Stable machine-readable code for IPC responses (never localized, never free-form).
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::InvalidInput => "invalid-input",
-            Self::InvalidDeviceId => "invalid-device-id",
-            Self::Unauthorized => "unauthorized",
-            Self::NotFound(_) => "not-found",
-            Self::AlreadyRunning(_) => "already-running",
-            Self::ToolUnavailable(_) => "tool-unavailable",
-            Self::SpawnFailed(_) => "spawn-failed",
-            Self::RateLimited => "rate-limited",
-            Self::Internal => "internal",
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceOrigin {
+    KdeConnect,
+    Adb,
+    UntrustedLanDiscovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub origin: DeviceOrigin,
+    pub paired: bool,
+    pub reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    Screen,
+    Camera,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSession {
+    pub session_id: String,
+    pub kind: StreamKind,
+    pub device_serial: Option<String>,
+    pub state: SessionState,
+    pub started_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonCapabilities {
+    pub protocol_version: u32,
+    pub platform: String,
+    pub scrcpy_available: bool,
+    pub kdeconnect_available: bool,
+    pub features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidRequest,
+    InvalidDeviceId,
+    DeviceNotFound,
+    ToolNotFound,
+    ToolExecutionFailed,
+    ToolTimeout,
+    SessionAlreadyRunning,
+    SessionNotFound,
+    IpcAuthenticationRequired,
+    PayloadTooLarge,
+    InternalError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainError {
+    pub code: ErrorCode,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl DomainError {
+    pub fn new(code: ErrorCode, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: msg.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(
+        code: ErrorCode,
+        msg: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            message: msg.into(),
+            detail: Some(detail.into()),
         }
     }
 }
 
-/// Validate a device id / ADB serial before it ever reaches an argv array.
-/// Injection firewall: no shell is used anywhere, but option-smuggling via
-/// crafted ids must also be impossible at the upstream-tool boundary.
-pub fn valid_device_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+impl std::fmt::Display for DomainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
-pub enum Command {
-    /// Health check / contract probe. Always available, no side effects.
-    Ping,
-    /// Current trusted/untrusted peer list from the discovery engine.
-    DevicesList,
-    /// Pair with a discovered device (KDE Connect pairing request).
-    DevicePair {
-        #[serde(default)]
-        device_id: String,
-    },
-    /// Ping a paired device end-to-end over the TCP session channel.
-    DevicePing {
-        #[serde(default)]
-        device_id: String,
-    },
-    /// Share a file/URL with a device.
-    DeviceSendFile {
-        #[serde(default)]
-        device_id: String,
-        #[serde(default)]
-        uri: String,
-    },
-    /// Start scrcpy screen mirroring. `serial` optional (single-device default).
-    MirrorStart {
-        #[serde(default)]
-        serial: Option<String>,
-    },
-    /// Start scrcpy camera streaming.
-    CameraStart {
-        #[serde(default)]
-        serial: Option<String>,
-    },
-    /// Stop a managed process by its supervisor handle.
-    ProcessStop { handle: u64 },
-    /// Snapshot of all supervised processes.
-    ProcessesList,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessInfo {
-    pub handle: u64,
-    pub kind: String,
-    pub running: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceInfo {
-    pub id: String,
-    pub name: String,
-    pub address: String,
-    pub paired: bool,
-}
-
-/// Parse and validate a command coming over IPC. Returns a typed error on any
-/// malformed or out-of-contract input; never panics on untrusted data.
-pub fn parse_command(json: &serde_json::Value) -> Result<Command, NexusError> {
-    serde_json::from_value::<Command>(json.clone()).map_err(|_| NexusError::InvalidInput)
-}
+impl std::error::Error for DomainError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_commands() {
-        let c = Command::MirrorStart { serial: Some("emulator-5554".into()) };
-        let j = serde_json::to_value(&c).unwrap();
-        assert_eq!(j["method"], "mirror_start");
-        let back = parse_command(&j).unwrap();
-        assert!(matches!(back, Command::MirrorStart { serial: Some(s) } if s == "emulator-5554"));
-    }
+    fn validates_device_ids_strictly() {
+        assert!(is_valid_device_id("device-123_test.0:x"));
+        assert!(is_valid_device_id("emulator-5554"));
+        assert!(is_valid_device_id("RFC1Y7WZ9HMLTVL9"));
 
-    #[test]
-    fn accepts_missing_serial() {
-        let c = parse_command(&serde_json::json!({ "method": "mirror_start" })).unwrap();
-        assert!(matches!(c, Command::MirrorStart { serial: None }));
-    }
-
-    #[test]
-    fn rejects_unknown_and_malformed() {
-        assert!(parse_command(&serde_json::json!({ "method": "rm_rf" })).is_err());
-        assert!(parse_command(&serde_json::json!({ "method": "process_stop", "handle": "x" })).is_err());
-        assert!(parse_command(&serde_json::json!("just a string")).is_err());
-    }
-
-    #[test]
-    fn device_id_firewall() {
-        assert!(valid_device_id("emulator-5554"));
-        assert!(valid_device_id("RFC1Y7WZ9HMLTVL9"));
-        assert!(valid_device_id("a.b:c-d_1"));
-        assert!(!valid_device_id(""));
-        assert!(!valid_device_id("--wrap=start-server-under-cover"));
-        assert!(!valid_device_id("id with spaces"));
-        assert!(!valid_device_id("semi;colon"));
-        assert!(!valid_device_id(&"x".repeat(129)));
+        assert!(!is_valid_device_id(""));
+        assert!(!is_valid_device_id("--switch"));
+        assert!(!is_valid_device_id("id with spaces"));
+        assert!(!is_valid_device_id("id;rm -rf /"));
+        assert!(!is_valid_device_id(&"a".repeat(129)));
+        assert!(!is_valid_device_id("-starts-with-dash"));
     }
 }

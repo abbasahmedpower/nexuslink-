@@ -1,321 +1,372 @@
-//! nexus-adapter-scrcpy — process supervision for the official scrcpy binary.
-//!
-//! P0 lifecycle fix (race-safe shutdown):
-//! - The `Child` handle is NEVER stored inside a mutex that stop() must acquire,
-//!   and no lock is EVER held across `child.wait().await`. Ownership lives in a
-//!   dedicated reaper task; state changes flow through an `Arc<Session>` whose
-//!   fields are updated with short-lived locks only.
-//! - stop() communicates with the reaper through per-session control channels,
-//!   so "monitor waiting on exit" and "stopper requesting termination" can never
-//!   deadlock against each other.
-//! - Bounded event channel with drop-newest policy: a stalled consumer cannot
-//!   grow memory without bound.
-
-use std::{
-    fmt,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
+use async_trait::async_trait;
+use nexus_domain::{
+    is_valid_device_id, DomainError, ErrorCode, SessionState, StreamKind, StreamSession,
 };
-use tokio::{process::Child, sync::mpsc};
-
-pub const EXIT_EVENT_CAP: usize = 256;
-pub const DEFAULT_KILL_GRACE: Duration = Duration::from_millis(3000);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedKind {
-    ScrcpyMirror,
-    ScrcpyCamera,
-    KdeCli,
-    DiscoveryDaemon,
-}
-
-impl fmt::Display for ManagedKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            ManagedKind::ScrcpyMirror => "scrcpy-mirror",
-            ManagedKind::ScrcpyCamera => "scrcpy-camera",
-            ManagedKind::KdeCli => "kde-cli",
-            ManagedKind::DiscoveryDaemon => "discovery",
-        };
-        f.write_str(s)
-    }
-}
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::{broadcast, Mutex};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
-pub struct ExitEvent {
-    pub handle: u64,
-    pub kind: ManagedKind,
-    /// Final exit status of the process, `None` if it was killed/unknown.
-    pub status: Option<String>,
+pub enum SessionEvent {
+    Started(StreamSession),
+    Exited {
+        session_id: String,
+        exit_code: Option<i32>,
+    },
+    Failed {
+        session_id: String,
+        error: String,
+    },
 }
 
-/// Shared session record. Cheap to clone (Arc), contains NO Child handle —
-/// the child is owned exclusively by the reaper task (single-owner invariant).
-struct Session {
-    kind: ManagedKind,
-    running: AtomicBool,
-    /// Notified when the slot reaches its terminal state.
-    done: tokio::sync::Notify,
+#[async_trait]
+pub trait ScrcpySupervisor: Send + Sync {
+    async fn start_mirror(
+        &self,
+        serial: Option<String>,
+        camera: bool,
+        record: Option<String>,
+    ) -> Result<StreamSession, DomainError>;
+
+    async fn stop_mirror(&self, session_id: Option<String>) -> Result<StreamSession, DomainError>;
+
+    async fn get_active_session(&self) -> Option<StreamSession>;
+
+    async fn check_available(&self) -> bool;
+
+    fn subscribe(&self) -> broadcast::Receiver<SessionEvent>;
 }
 
-enum Control {
-    Terminate,
+struct ManagedChild {
+    session: StreamSession,
+    child: Child,
+    #[allow(dead_code)]
+    birth_time: Instant,
 }
 
-/// Thread-safe supervisor. Locks guard only O(1) bookkeeping maps; they are
-/// never held across an await, so there is no deadlock surface at all.
-pub struct Supervisor {
-    inner: Mutex<Vec<(u64, Arc<Session>)>>,
-    next_id: AtomicU64,
-    tx: mpsc::Sender<ExitEvent>,
-    rx: Arc<Mutex<Option<mpsc::Receiver<ExitEvent>>>>,
-    controls: Mutex<Vec<(u64, mpsc::UnboundedSender<Control>)>>,
+pub struct ProcessScrcpySupervisor {
+    executable: PathBuf,
+    active: Arc<Mutex<Option<ManagedChild>>>,
+    history: Arc<Mutex<HashMap<String, StreamSession>>>,
+    events: broadcast::Sender<SessionEvent>,
+    counter: AtomicU64,
 }
 
-impl Supervisor {
-    pub fn new() -> Arc<Self> {
-        let (tx, rx) = mpsc::channel(EXIT_EVENT_CAP);
-        Arc::new(Self {
-            inner: Mutex::new(Vec::new()),
-            next_id: AtomicU64::new(1),
-            tx,
-            rx: Arc::new(Mutex::new(Some(rx))),
-            controls: Mutex::new(Vec::new()),
-        })
+impl ProcessScrcpySupervisor {
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        let (tx, _) = broadcast::channel(128);
+        Self {
+            executable: executable.into(),
+            active: Arc::new(Mutex::new(None)),
+            history: Arc::new(Mutex::new(HashMap::new())),
+            events: tx,
+            counter: AtomicU64::new(1),
+        }
     }
 
-    /// Take the event receiver (only the first caller gets it).
-    pub fn subscribe(&self) -> Option<mpsc::Receiver<ExitEvent>> {
-        self.rx.lock().unwrap().take()
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
+
+#[async_trait]
+impl ScrcpySupervisor for ProcessScrcpySupervisor {
+    async fn check_available(&self) -> bool {
+        let mut cmd = Command::new(&self.executable);
+        cmd.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        match tokio::time::timeout(Duration::from_secs(3), cmd.status()).await {
+            Ok(Ok(status)) => status.success(),
+            _ => false,
+        }
     }
 
-    /// Number of slots currently registered (running or mid-exit).
-    pub fn count(&self) -> usize {
-        self.inner.lock().unwrap().len()
+    fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        self.events.subscribe()
     }
 
-    /// Snapshot of live managed processes.
-    pub fn list(&self) -> Vec<(u64, ManagedKind)> {
-        let g = self.inner.lock().unwrap();
-        let mut v: Vec<_> = g
-            .iter()
-            .filter_map(|(k, s)| s.running.load(Ordering::Acquire).then_some((*k, s.kind)))
-            .collect();
-        v.sort_by_key(|(k, _)| *k);
-        v
+    async fn get_active_session(&self) -> Option<StreamSession> {
+        let lock = self.active.lock().await;
+        lock.as_ref().map(|m| m.session.clone())
     }
 
-    pub fn is_running(&self, kind: ManagedKind) -> bool {
-        self.list().iter().any(|(_, k)| *k == kind)
-    }
+    async fn start_mirror(
+        &self,
+        serial: Option<String>,
+        camera: bool,
+        record: Option<String>,
+    ) -> Result<StreamSession, DomainError> {
+        let mut lock = self.active.lock().await;
 
-    /// Adopt an already-spawned child under supervision. The child moves into a
-    /// dedicated reaper task which owns it until exit — nothing else can touch it.
-    pub fn adopt(self: &Arc<Self>, kind: ManagedKind, child: Child) -> u64 {
-        let handle = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let session = Arc::new(Session { kind, running: AtomicBool::new(true), done: tokio::sync::Notify::new() });
-        self.inner.lock().unwrap().push((handle, session.clone()));
-        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<Control>();
-        self.controls.lock().unwrap().push((handle, ctl_tx));
+        if let Some(ref m) = *lock {
+            return Err(DomainError::with_detail(
+                ErrorCode::SessionAlreadyRunning,
+                "A streaming session is already active",
+                format!("Active session ID: {}", m.session.session_id),
+            ));
+        }
 
-        let me = Arc::clone(self);
+        if let Some(ref s) = serial {
+            if !s.is_empty() && !is_valid_device_id(s) {
+                return Err(DomainError::new(
+                    ErrorCode::InvalidDeviceId,
+                    "Invalid ADB serial",
+                ));
+            }
+        }
+
+        let session_id = format!("scrcpy-{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        let kind = if camera {
+            StreamKind::Camera
+        } else {
+            StreamKind::Screen
+        };
+
+        let mut cmd = Command::new(&self.executable);
+
+        // Build strictly validated arguments (no shell)
+        if let Some(ref s) = serial {
+            if !s.is_empty() {
+                cmd.args(["--serial", s]);
+            }
+        }
+
+        if camera {
+            cmd.arg("--video-source=camera");
+        }
+
+        if let Some(ref rec) = record {
+            let rec = rec.trim();
+            if !rec.is_empty() {
+                cmd.args(["--record", rec]);
+            }
+        }
+
+        cmd.arg("--max-fps=60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(DomainError::with_detail(
+                    ErrorCode::ToolNotFound,
+                    format!("Failed to start scrcpy: {}", e),
+                    e.to_string(),
+                ));
+            }
+        };
+
+        let pid = child.id();
+        info!("Started scrcpy child pid: {:?}", pid);
+
+        let mut stdout_pipe = child.stdout.take().unwrap();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+
+        let session = StreamSession {
+            session_id: session_id.clone(),
+            kind,
+            device_serial: serial,
+            state: SessionState::Running,
+            started_at_ms: Self::now_ms(),
+            pid,
+            exit_code: None,
+            last_error: None,
+        };
+
+        *lock = Some(ManagedChild {
+            session: session.clone(),
+            child,
+            birth_time: Instant::now(),
+        });
+        drop(lock);
+
+        let _ = self.events.send(SessionEvent::Started(session.clone()));
+
+        // Background monitor for exit + log draining
+        let active_clone = self.active.clone();
+        let history_clone = self.history.clone();
+        let events_clone = self.events.clone();
+        let sess_id_clone = session_id.clone();
+
         tokio::spawn(async move {
-            // ---- REAPER: sole owner of the Child. No lock is held here while waiting. ----
-            let mut child = child;
-            let status = tokio::select! {
-                status = child.wait() => status.ok(),
-                Some(Control::Terminate) = ctl_rx.recv() => {
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        send_sigterm(pid as i32);
+            let mut out_tail = Vec::new();
+            let mut err_tail = Vec::new();
+
+            let drain_fut = async {
+                let _ = tokio::join!(
+                    stdout_pipe.read_to_end(&mut out_tail),
+                    stderr_pipe.read_to_end(&mut err_tail)
+                );
+            };
+
+            let wait_fut = async {
+                let mut guard = active_clone.lock().await;
+                if let Some(ref mut m) = *guard {
+                    if m.session.session_id == sess_id_clone {
+                        return m.child.wait().await;
                     }
-                    // Graceful window, then hard kill. All awaits happen WITHOUT any lock.
-                    if tokio::time::timeout(DEFAULT_KILL_GRACE, child.wait()).await.is_err() {
-                        let _ = child.start_kill();
-                        let _ = tokio::time::timeout(Duration::from_millis(1000), child.wait()).await;
-                    }
-                    None
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Session replaced",
+                ))
+            };
+
+            let (_drain_res, wait_res) = tokio::join!(drain_fut, wait_fut);
+
+            let (exit_code, err_msg) = match wait_res {
+                Ok(status) => {
+                    info!("scrcpy session {} finished with: {}", sess_id_clone, status);
+                    let code = status.code();
+                    let err = if !status.success() {
+                        let e_str = String::from_utf8_lossy(&err_tail).trim().to_string();
+                        if e_str.is_empty() {
+                            Some(format!("Exited with code: {:?}", code))
+                        } else {
+                            Some(e_str)
+                        }
+                    } else {
+                        None
+                    };
+                    (code, err)
+                }
+                Err(e) => {
+                    warn!("scrcpy wait error: {}", e);
+                    (None, Some(e.to_string()))
                 }
             };
-            drop(child);
-            session.running.store(false, Ordering::Release);
-            session.done.notify_waiters();
-            // Remove bookkeeping entries (short lock, no await inside).
-            {
-                let mut g = me.inner.lock().unwrap();
-                g.retain(|(h, _)| *h != handle);
-            }
-            {
-                let mut g = me.controls.lock().unwrap();
-                g.retain(|(h, _)| *h != handle);
-            }
-            let event = ExitEvent { handle, kind, status: status.map(|s| s.to_string()) };
-            // Bounded queue, drop-newest: the reaper must never block and memory must
-            // never grow. Lost events are still observable via `list()`/state queries.
-            if let Err(e) = me.tx.try_send(event) {
-                tracing::warn!("exit-event queue full or closed, dropping event: {e}");
+
+            let mut guard = active_clone.lock().await;
+            if let Some(ref m) = *guard {
+                if m.session.session_id == sess_id_clone {
+                    let mut final_session = m.session.clone();
+                    final_session.state = if exit_code == Some(0) {
+                        SessionState::Stopped
+                    } else {
+                        SessionState::Failed
+                    };
+                    final_session.exit_code = exit_code;
+                    final_session.last_error = err_msg.clone();
+
+                    history_clone
+                        .lock()
+                        .await
+                        .insert(sess_id_clone.clone(), final_session.clone());
+
+                    *guard = None;
+
+                    if let Some(err) = err_msg {
+                        let _ = events_clone.send(SessionEvent::Failed {
+                            session_id: sess_id_clone,
+                            error: err,
+                        });
+                    } else {
+                        let _ = events_clone.send(SessionEvent::Exited {
+                            session_id: sess_id_clone,
+                            exit_code,
+                        });
+                    }
+                }
             }
         });
-        handle
-    }
 
-    /// Request termination of a managed process and confirm it went terminal.
-    /// Safe against races with natural exit: the reaper drains either path and
-    /// we always finish by observing `done` or the removed slot.
-    pub async fn stop(&self, handle: u64, grace: Duration) -> bool {
-        // Register interest in the terminal notification BEFORE signalling, so a
-        // fast exit cannot slip between notify and wait (classic lost-wakeup race).
-        let session = self.inner.lock().unwrap().iter().find(|(h, _)| *h == handle).map(|(_, s)| s.clone());
-        let Some(session) = session else { return true }; // unknown handle: already gone
-        let notified = session.done.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-
-        let sender = self.controls.lock().unwrap().iter().find(|(h, _)| *h == handle).map(|(_, c)| c.clone());
-        if let Some(c) = sender {
-            let _ = c.send(Control::Terminate);
+        // Quick failure detection
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let lock = self.active.lock().await;
+            if lock.is_none() {
+                let hist = self.history.lock().await;
+                if let Some(s) = hist.get(&session_id) {
+                    if s.state == SessionState::Failed {
+                        return Err(DomainError::with_detail(
+                            ErrorCode::ToolExecutionFailed,
+                            "scrcpy failed immediately on startup",
+                            s.last_error
+                                .clone()
+                                .unwrap_or_else(|| "Unknown failure".into()),
+                        ));
+                    }
+                }
+            }
         }
 
-        // Wait for the reaper to publish the terminal state (no lock held during await).
-        if tokio::time::timeout(grace, notified).await.is_ok() {
-            return true;
+        Ok(session)
+    }
+
+    async fn stop_mirror(&self, session_id: Option<String>) -> Result<StreamSession, DomainError> {
+        let mut lock = self.active.lock().await;
+
+        let mut managed = match lock.take() {
+            Some(m) => m,
+            None => {
+                return Err(DomainError::new(
+                    ErrorCode::SessionNotFound,
+                    "No active stream owned by Nexus.",
+                ));
+            }
+        };
+
+        if let Some(ref sid) = session_id {
+            if managed.session.session_id != *sid {
+                let active_sid = managed.session.session_id.clone();
+                *lock = Some(managed);
+                return Err(DomainError::with_detail(
+                    ErrorCode::SessionNotFound,
+                    "Session ID does not match active stream",
+                    format!("Requested: {}, Active: {}", sid, active_sid),
+                ));
+            }
         }
-        // Even on timeout we report best-effort truth: check whether the slot is gone.
-        !self.inner.lock().unwrap().iter().any(|(h, _)| *h == handle)
-    }
 
-    /// Stop everything (shutdown path). Remaining children are terminated via
-    /// their control channels; kill_on_drop is belt-and-suspenders.
-    pub fn stop_all(&self) {
-        let senders: Vec<_> = self.controls.lock().unwrap().iter().map(|(_, c)| c.clone()).collect();
-        for c in senders {
-            let _ = c.send(Control::Terminate);
+        managed.session.state = SessionState::Stopping;
+
+        if let Err(e) = managed.child.kill().await {
+            warn!("Failed to send kill to scrcpy: {}", e);
         }
-    }
-}
 
-// --- tiny platform helper kept private to this module ---
+        let wait_res = tokio::time::timeout(Duration::from_secs(3), managed.child.wait()).await;
 
-#[cfg(unix)]
-fn send_sigterm(pid: i32) {
-    // SIGTERM delivered via libc crate (portable binding, checked return ignored:
-    // ESRCH simply means the process already exited — fine for us).
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-}
+        let mut final_session = managed.session.clone();
+        final_session.state = SessionState::Stopped;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::process::Command;
-
-    fn spawn_dummy(secs: f64) -> Child {
-        Command::new("sh")
-            .arg("-c")
-            .arg(format!("sleep {secs}"))
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn sh")
-    }
-
-    #[tokio::test]
-    async fn reaps_exit_event() {
-        let sup = Supervisor::new();
-        let mut rx = sup.subscribe().expect("first subscriber");
-        let h = sup.adopt(ManagedKind::KdeCli, spawn_dummy(0.05));
-        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("event").expect("channel open");
-        assert_eq!(ev.handle, h);
-        assert!(ev.status.is_some());
-        assert_eq!(sup.count(), 0);
-    }
-
-    #[tokio::test]
-    async fn graceful_stop_confirmed() {
-        let sup = Supervisor::new();
-        let _rx = sup.subscribe();
-        let h = sup.adopt(ManagedKind::ScrcpyMirror, spawn_dummy(30.0));
-        assert!(sup.is_running(ManagedKind::ScrcpyMirror));
-        let ok = sup.stop(h, Duration::from_millis(800)).await;
-        assert!(ok);
-        assert_eq!(sup.count(), 0);
-    }
-
-    #[tokio::test]
-    async fn stop_unknown_handle_is_true() {
-        let sup = Supervisor::new();
-        assert!(sup.stop(9999, Duration::from_millis(50)).await);
-    }
-
-    #[tokio::test]
-    async fn stop_escalates_when_sigterm_is_ignored() {
-        // Child traps SIGTERM and ignores it; supervisor escalates to SIGKILL.
-        let sup = Supervisor::new();
-        let _rx = sup.subscribe();
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("trap '' TERM; while true; do sleep 0.1; done")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn sh");
-        let h = sup.adopt(ManagedKind::ScrcpyMirror, child);
-        let ok = sup.stop(h, Duration::from_millis(300)).await;
-        assert!(ok, "escalation should confirm termination");
-        assert_eq!(sup.count(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn external_kill_updates_state() {
-        // Micro-level scenario: process dies outside our control (adb crash etc.).
-        let sup = Supervisor::new();
-        let mut rx = sup.subscribe().expect("first subscriber");
-        let child = Command::new("sh").arg("-c").arg("sleep 30").kill_on_drop(true).spawn().expect("spawn");
-        let pid = child.id().expect("pid");
-        let h = sup.adopt(ManagedKind::ScrcpyMirror, child);
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("event").expect("open");
-        assert_eq!(ev.handle, h);
-        assert!(!sup.is_running(ManagedKind::ScrcpyMirror));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_stop_and_exit_no_deadlock_or_leak() {
-        let sup = Supervisor::new();
-        let _rx = sup.subscribe();
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let s = sup.clone();
-            handles.push(tokio::spawn(async move {
-                let h = s.adopt(ManagedKind::KdeCli, spawn_dummy(0.02));
-                // Race a stop against the natural exit; either outcome is fine.
-                let _ = s.stop(h, Duration::from_millis(500)).await;
-            }));
+        match wait_res {
+            Ok(Ok(status)) => {
+                final_session.exit_code = status.code();
+            }
+            Ok(Err(e)) => {
+                final_session.last_error = Some(e.to_string());
+            }
+            Err(_) => {
+                final_session.last_error =
+                    Some("Stop requested but termination timed out".to_string());
+            }
         }
-        for h in handles {
-            let _ = h.await;
-        }
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(sup.count(), 0, "slots leaked");
-    }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stop_while_monitor_waits_never_deadlocks() {
-        // The exact P0 regression: long-running child + immediate stop must complete.
-        // Deterministic timing rationale: SIGTERM terminates `sh` almost instantly, but
-        // its `sleep 60` grandchild inherits the stdout/stderr pipes and keeps them open,
-        // so tokio's Child::wait (pipe-draining) only returns once the holder dies as well.
-        // The grace window must comfortably exceed that drain latency on loaded CI machines;
-        // the hard outer timeout still proves there is no deadlock (the original bug).
-        let sup = Supervisor::new();
-        let _rx = sup.subscribe();
-        let h = sup.adopt(ManagedKind::ScrcpyMirror, spawn_dummy(60.0));
-        // Grace (2s) > pipe-drain latency; outer timeout (5s) still bounds the test.
-        let ok = tokio::time::timeout(Duration::from_secs(5), sup.stop(h, Duration::from_millis(2000))).await;
-        assert!(ok.is_ok(), "stop deadlocked");
-        assert!(ok.unwrap());
-        assert_eq!(sup.count(), 0);
+        self.history
+            .lock()
+            .await
+            .insert(final_session.session_id.clone(), final_session.clone());
+
+        let _ = self.events.send(SessionEvent::Exited {
+            session_id: final_session.session_id.clone(),
+            exit_code: final_session.exit_code,
+        });
+
+        Ok(final_session)
     }
 }
