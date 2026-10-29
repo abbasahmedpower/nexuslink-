@@ -1,0 +1,12 @@
+name: nexus_hub
+version: 0.1.0+1
+description: Local-first multi-device dashboard starter
+publish_to: none
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+flutter:
+  uses-material-design: true

@@ -1,0 +1,8 @@
+target/
+.dart_tool/
+.flutter-plugins*
+ui/build/
+ui/.metadata
+ui/.idea/
+*.log
+.env
