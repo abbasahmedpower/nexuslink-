@@ -103,23 +103,27 @@ impl PairingStateMachine {
                 }
             }
 
-            // Peer accepted our pairing request
+            // Peer accepted our pairing request or local user accepted peer's request
             (
                 DeviceConnectionState::PairingRequestedByUs { identity },
                 PairingEvent::AcceptPairing { fingerprint },
-            ) => DeviceConnectionState::Paired {
-                identity: identity.clone(),
-                fingerprint,
-            },
-
-            // Local user accepted peer's pairing request
-            (
+            )
+            | (
                 DeviceConnectionState::PairingRequestedByPeer { identity },
                 PairingEvent::AcceptPairing { fingerprint },
-            ) => DeviceConnectionState::Paired {
-                identity: identity.clone(),
-                fingerprint,
-            },
+            ) => {
+                // Cryptographic validation: Verify fingerprint format before transitioning to Paired state
+                if crate::crypto::CertificateFingerprint::parse_str(&fingerprint).is_none() {
+                    return Err(ProtocolError::InvalidPacket(format!(
+                        "Invalid certificate fingerprint format for device {}",
+                        identity.device_id
+                    )));
+                }
+                DeviceConnectionState::Paired {
+                    identity: identity.clone(),
+                    fingerprint,
+                }
+            }
 
             // Either side rejects pairing
             (
@@ -167,7 +171,7 @@ impl PairingStateMachine {
             _ => {
                 return Err(ProtocolError::InvalidStateTransition {
                     from: Box::new(current),
-                    event,
+                    event: Box::new(event),
                 });
             }
         };

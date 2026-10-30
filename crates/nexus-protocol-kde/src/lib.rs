@@ -39,6 +39,6 @@ pub enum ProtocolError {
     #[error("Invalid state transition: cannot transition from {from:?} with event {event:?}")]
     InvalidStateTransition {
         from: Box<DeviceConnectionState>,
-        event: PairingEvent,
+        event: Box<PairingEvent>,
     },
 }

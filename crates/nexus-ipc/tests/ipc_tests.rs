@@ -207,3 +207,67 @@ async fn test_ipc_rejects_oversized_frame() {
         other => panic!("Expected PayloadTooLarge error, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_concurrent_ipc_clients() {
+    let port = 19874;
+    let (_server, token) = create_test_server(port);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Spawn 5 concurrent clients
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let tok = token.clone();
+        handles.push(tokio::spawn(async move {
+            let stream = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("Failed to connect");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+
+            // Handshake
+            let hs_req = WireMessage {
+                id: (i + 1) * 100,
+                body: WireMessageBody::Request(IpcRequest::Handshake {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: format!("stress_client_{}", i),
+                    auth_token: Some(tok),
+                }),
+            };
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&hs_req).unwrap()).as_bytes())
+                .await
+                .unwrap();
+
+            let mut resp = String::new();
+            reader.read_line(&mut resp).await.unwrap();
+            let wire_resp: WireMessage = serde_json::from_str(&resp).unwrap();
+            assert!(matches!(
+                wire_resp.body,
+                WireMessageBody::Response(IpcResponse::Ok { .. })
+            ));
+
+            // Request capabilities
+            let cap_req = WireMessage {
+                id: (i + 1) * 100 + 1,
+                body: WireMessageBody::Request(IpcRequest::GetCapabilities),
+            };
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&cap_req).unwrap()).as_bytes())
+                .await
+                .unwrap();
+
+            let mut resp2 = String::new();
+            reader.read_line(&mut resp2).await.unwrap();
+            let wire_resp2: WireMessage = serde_json::from_str(&resp2).unwrap();
+            assert!(matches!(
+                wire_resp2.body,
+                WireMessageBody::Response(IpcResponse::Ok { .. })
+            ));
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("Client task panicked");
+    }
+}

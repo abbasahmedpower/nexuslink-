@@ -6,6 +6,48 @@ use nexus_protocol_kde::packet::{
 use nexus_protocol_kde::ProtocolError;
 
 #[test]
+fn test_memory_layout_and_size_of() {
+    let err_size = std::mem::size_of::<nexus_protocol_kde::ProtocolError>();
+    println!("ProtocolError size: {} bytes", err_size);
+    // Explicit layout proof: ProtocolError is compact (<= 32 bytes)
+    assert!(
+        err_size <= 32,
+        "ProtocolError size ({} bytes) exceeds cache threshold of 32 bytes",
+        err_size
+    );
+
+    let fp_size = std::mem::size_of::<nexus_protocol_kde::CertificateFingerprint>();
+    assert_eq!(
+        fp_size, 32,
+        "CertificateFingerprint must be exactly 32 bytes"
+    );
+}
+
+#[test]
+fn test_reject_invalid_fingerprint_on_pairing() {
+    let identity = IdentityBody {
+        device_id: "phone-test-fp".into(),
+        device_name: "Phone".into(),
+        device_type: DeviceType::Phone,
+        protocol_version: 7,
+        tcp_port: Some(1716),
+        incoming_capabilities: vec![],
+        outgoing_capabilities: vec![],
+    };
+
+    let mut fsm = PairingStateMachine::new(identity);
+    fsm.transition(PairingEvent::ReceivePairRequest).unwrap();
+
+    // Attempt pairing with non-hex garbage string
+    let bad_fp = "not-a-valid-sha256-fingerprint".to_string();
+    let err = fsm.transition(PairingEvent::AcceptPairing {
+        fingerprint: bad_fp,
+    });
+    assert!(matches!(err, Err(ProtocolError::InvalidPacket(_))));
+    assert!(!fsm.is_paired());
+}
+
+#[test]
 fn test_sha256_known_vectors() {
     // Vector 1: Empty string
     let h1 = sha256_digest(b"");

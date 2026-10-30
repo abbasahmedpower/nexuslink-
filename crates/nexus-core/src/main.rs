@@ -82,44 +82,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
-    // 3. Passive LAN discovery (receive-only; does not collide or broadcast fake identity)
-    let listener = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, protocol::KDE_PORT)).await {
-        Ok(udp) => {
-            let _ = udp.set_broadcast(true);
-            let socket = Arc::new(udp);
-            let state = peers.clone();
-            let own_id = id.clone();
-            info!(
-                "Passive LAN discovery listener active on UDP port {}",
-                protocol::KDE_PORT
-            );
-            Some(tokio::spawn(async move {
-                let mut buf = [0_u8; protocol::MAX_DATAGRAM];
-                loop {
-                    match socket.recv_from(&mut buf).await {
-                        Ok((n, source)) => {
-                            if let Some(identity) = protocol::parse_identity(&buf[..n]) {
-                                if identity.device_id != own_id {
-                                    state.write().await.observe(
-                                        identity,
-                                        source.ip(),
-                                        Instant::now(),
-                                    );
+    // 3. Passive LAN discovery (strictly opt-in to avoid probing UDP 1716 when official KDE Connect daemon is present)
+    let enable_lan_discovery = env::var("NEXUS_ENABLE_LAN_DISCOVERY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let listener = if enable_lan_discovery {
+        match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, protocol::KDE_PORT)).await {
+            Ok(udp) => {
+                let _ = udp.set_broadcast(true);
+                let socket = Arc::new(udp);
+                let state = peers.clone();
+                let own_id = id.clone();
+                info!(
+                    "Passive LAN discovery listener active on UDP port {}",
+                    protocol::KDE_PORT
+                );
+                Some(tokio::spawn(async move {
+                    let mut buf = [0_u8; protocol::MAX_DATAGRAM];
+                    loop {
+                        match socket.recv_from(&mut buf).await {
+                            Ok((n, source)) => {
+                                if let Some(identity) = protocol::parse_identity(&buf[..n]) {
+                                    if identity.device_id != own_id {
+                                        state.write().await.observe(
+                                            identity,
+                                            source.ip(),
+                                            Instant::now(),
+                                        );
+                                    }
                                 }
                             }
+                            Err(e) => warn!("Discovery receive error: {e}"),
                         }
-                        Err(e) => warn!("Discovery receive error: {e}"),
                     }
-                }
-            }))
+                }))
+            }
+            Err(e) => {
+                warn!(
+                    "Passive UDP listener could not bind to port {}: {}. Official KDE Connect daemon is running; discovery defers cleanly to kdeconnect-cli.",
+                    protocol::KDE_PORT, e
+                );
+                None
+            }
         }
-        Err(e) => {
-            warn!(
-                "Passive UDP listener could not bind to port {}: {}. Real KDE Connect daemon or another process is running; LAN discovery will defer to kdeconnect-cli.",
-                protocol::KDE_PORT, e
-            );
-            None
-        }
+    } else {
+        info!("Passive UDP port 1716 probing disabled by default. Operating in pure managed adapter mode.");
+        None
     };
 
     // 4. Insecure legacy HTTP server (disabled by default; strictly opt-in)

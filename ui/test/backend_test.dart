@@ -33,4 +33,10 @@ void main() {
     expect(sess.state, 'running');
     expect(sess.pid, 9999);
   });
+
+  test('NexusIpcClient initializes disconnected and unauthenticated', () {
+    final client = NexusIpcClient();
+    expect(client.isConnected, false);
+    client.dispose();
+  });
 }

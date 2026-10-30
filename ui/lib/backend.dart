@@ -82,6 +82,8 @@ class NexusIpcClient {
   final String host;
   final int port;
   Socket? _socket;
+  bool _authenticated = false;
+  Future<void>? _connectingFuture;
   StreamSubscription? _sub;
   int _seq = 1;
   final Map<int, Completer<Map<String, dynamic>>> _pending = {};
@@ -90,7 +92,8 @@ class NexusIpcClient {
 
   NexusIpcClient({this.host = '127.0.0.1', this.port = 8788});
 
-  bool get isConnected => _socket != null;
+  /// True ONLY when the socket is connected AND handshake has been accepted by daemon.
+  bool get isConnected => _socket != null && _authenticated;
   Stream<Map<String, dynamic>> get events => _events.stream;
 
   static String? readAuthToken() {
@@ -124,10 +127,11 @@ class NexusIpcClient {
     return null;
   }
 
-  Future<void>? _connectingFuture;
-
+  /// Single-flight connection establishment.
+  /// Guarantees that concurrent callers wait on the same connection attempt,
+  /// and NO request can bypass the handshake phase.
   Future<void> connect() async {
-    if (_socket != null) return;
+    if (_socket != null && _authenticated) return;
     if (_connectingFuture != null) {
       await _connectingFuture;
       return;
@@ -141,8 +145,8 @@ class NexusIpcClient {
   }
 
   Future<void> _doConnect() async {
+    _cleanup();
     final s = await Socket.connect(host, port, timeout: const Duration(seconds: 3));
-    _socket = s;
     s.transform(utf8.decoder).transform(const LineSplitter()).listen(
       _onLine,
       onError: (err) {
@@ -153,9 +157,9 @@ class NexusIpcClient {
       },
     );
 
-    // Perform Handshake
+    // Perform Handshake on raw connection BEFORE assigning to _socket
     final token = readAuthToken();
-    final res = await _call('handshake', {
+    final res = await _writeRaw(s, 'handshake', {
       'protocol_version': 1,
       'client_name': 'flutter-desktop-ui',
       if (token != null) 'auth_token': token,
@@ -163,15 +167,21 @@ class NexusIpcClient {
 
     if (res['status'] != 'ok') {
       final err = res['error']?['message'] ?? 'Authentication failed';
+      s.destroy();
       _cleanup();
       throw Exception('IPC handshake rejected: ' + err.toString());
     }
+
+    // Handshake confirmed by daemon: mark authenticated and assign socket
+    _socket = s;
+    _authenticated = true;
 
     // Subscribe to daemon events
     unawaited(_call('subscribe_events', null));
   }
 
   void _cleanup() {
+    _authenticated = false;
     _socket?.destroy();
     _socket = null;
     for (final completer in _pending.values) {
@@ -196,10 +206,7 @@ class NexusIpcClient {
     } catch (_) {}
   }
 
-  Future<Map<String, dynamic>> _call(String action, dynamic payload) async {
-    if (_socket == null) {
-      await connect();
-    }
+  Future<Map<String, dynamic>> _writeRaw(Socket s, String action, dynamic payload) {
     final id = _seq++;
     final completer = Completer<Map<String, dynamic>>();
     _pending[id] = completer;
@@ -210,7 +217,37 @@ class NexusIpcClient {
       if (payload != null) 'payload': payload,
     });
 
-    _socket!.write('$req\n');
+    s.write('$req\n');
+
+    return completer.future.timeout(
+      const Duration(seconds: 15),
+      onTimeout: () {
+        _pending.remove(id);
+        throw TimeoutException('Handshake timed out: $action');
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> _call(String action, dynamic payload) async {
+    if (!_authenticated) {
+      await connect();
+    }
+    final s = _socket;
+    if (s == null || !_authenticated) {
+      throw StateError('Cannot send request: IPC client is not authenticated');
+    }
+
+    final id = _seq++;
+    final completer = Completer<Map<String, dynamic>>();
+    _pending[id] = completer;
+
+    final req = jsonEncode({
+      'id': id,
+      'action': action,
+      if (payload != null) 'payload': payload,
+    });
+
+    s.write('$req\n');
 
     return completer.future.timeout(
       const Duration(seconds: 15),

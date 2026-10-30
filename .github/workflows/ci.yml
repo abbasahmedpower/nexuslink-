@@ -43,6 +43,31 @@ jobs:
       - name: Cargo test workspace
         run: cargo test --workspace
 
+  flutter-check:
+    name: Flutter Desktop UI Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: true
+
+      - name: Install dependencies
+        working-directory: ui
+        run: flutter pub get
+
+      - name: Run Flutter analyzer
+        working-directory: ui
+        run: flutter analyze
+
+      - name: Run Flutter unit tests
+        working-directory: ui
+        run: flutter test
+
   scripts-and-contracts:
     name: Architecture & Contract Verification
     runs-on: ubuntu-latest
