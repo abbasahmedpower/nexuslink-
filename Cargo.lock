@@ -162,6 +162,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-protocol-kde"
+version = "1.0.0"
+dependencies = [
+ "nexus-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

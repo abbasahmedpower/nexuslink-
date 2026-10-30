@@ -1,0 +1,12 @@
+[package]
+name = "nexus-protocol-kde"
+version = "1.0.0"
+edition = "2021"
+description = "Native pure-Rust KDE Connect protocol engine (Spike) - Zero external CLI dependencies"
+license = "Apache-2.0"
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1.0"

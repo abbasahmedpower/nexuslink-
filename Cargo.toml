@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/nexus-domain",
+    "crates/nexus-protocol-kde",
     "crates/nexus-adapter-kde",
     "crates/nexus-adapter-scrcpy",
     "crates/nexus-application",
