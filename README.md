@@ -1,14 +1,16 @@
-# Nexus Hub v0.3 - upstream integration prototype
+# Nexus Hub v0.4 - Hardened IPC & Managed Integrations
 
-A real, minimal **desktop GUI integration** of the existing `scrcpy` and KDE Connect executables. It adds useful behavior to the previous Rust discovery-only project without importing vendor code or rewriting well-maintained core protocols.
+A robust, minimal **desktop GUI integration** of the existing `scrcpy` and KDE Connect executables. It combines process supervision, bounded local IPC authentication, and unified device integration without rewriting mature protocols.
 
-## What works (assuming installed tools)
-- List paired/reachable KDE Connect devices using `kdeconnect-cli --list-available --id-name-only`
-- Request pairing or send ping via official KDE Connect
-- Share a file/URL through KDE Connect
-- Launch/stop official scrcpy screen streaming as an owned child
-- Launch/stop supported scrcpy camera streaming
-- Optional separate Rust discovery daemon with untrusted peer listing
+## What works
+- List paired/reachable KDE Connect devices via `kdeconnect-cli`
+- Request pairing and send ping via KDE Connect
+- Share a file/URL securely through KDE Connect
+- Launch/stop official `scrcpy` screen streaming with full state-machine process supervision
+- Launch/stop official `scrcpy` camera streaming
+- Authenticated, bounded local TCP IPC (Bearer token auth, CSPRNG, constant-time compare, 64 KiB frame limits)
+- UDP discovery daemon with bounded untrusted peer caching (MAX_PEERS=128 + TTL 90s)
+- Discovery query exposed via IPC (`get_discovery_peers`) with unauthenticated HTTP 8787 disabled by default
 
 These calls are wired into the Flutter UI, not demo buttons. **Not implemented:** embedded video in the window, real native TLS pairing, notifications reading, SMS, virtual camera on Windows, Android companion app, releases, or benchmarked performance.
 

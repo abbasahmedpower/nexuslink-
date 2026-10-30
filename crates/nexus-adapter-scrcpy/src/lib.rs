@@ -40,6 +40,9 @@ struct SessionInfo {
     completed: Arc<Notify>,
 }
 
+/// Maximum number of completed sessions kept in history to prevent unbounded memory growth.
+const MAX_HISTORY: usize = 1_000;
+
 pub struct ProcessScrcpySupervisor {
     executable: PathBuf,
     /// Holds only session metadata + signals. Child handle is owned by the monitor task.
@@ -47,17 +50,24 @@ pub struct ProcessScrcpySupervisor {
     history: Arc<Mutex<HashMap<String, StreamSession>>>,
     events: broadcast::Sender<SessionEvent>,
     counter: AtomicU64,
+    /// Daemon start timestamp in milliseconds (used to make session IDs unique across restarts).
+    daemon_start_ms: u64,
 }
 
 impl ProcessScrcpySupervisor {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         let (tx, _) = broadcast::channel(128);
+        let daemon_start_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Self {
             executable: executable.into(),
             active: Arc::new(Mutex::new(None)),
             history: Arc::new(Mutex::new(HashMap::new())),
             events: tx,
             counter: AtomicU64::new(1),
+            daemon_start_ms,
         }
     }
 
@@ -117,7 +127,12 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
             }
         }
 
-        let session_id = format!("scrcpy-{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        // Prefix with daemon start timestamp to ensure uniqueness across daemon restarts.
+        let session_id = format!(
+            "scrcpy-{}-{}",
+            self.daemon_start_ms,
+            self.counter.fetch_add(1, Ordering::SeqCst)
+        );
         let kind = if camera {
             StreamKind::Camera
         } else {
@@ -290,11 +305,20 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
             final_session.exit_code = exit_code;
             final_session.last_error = err_msg.clone();
 
-            // Save to history — monitor task is the single source of truth for session completion
-            history_clone
-                .lock()
-                .await
-                .insert(sess_id_clone.clone(), final_session.clone());
+            // Save to history with bounded size (MAX_HISTORY) — monitor task is the single source of truth for session completion
+            let mut hist = history_clone.lock().await;
+            if hist.len() >= MAX_HISTORY {
+                // Prune oldest entry by earliest started_at_ms (O(n) but history cap keeps it fast)
+                if let Some(oldest_key) = hist
+                    .iter()
+                    .min_by_key(|(_, s)| s.started_at_ms)
+                    .map(|(k, _)| k.clone())
+                {
+                    hist.remove(&oldest_key);
+                }
+            }
+            hist.insert(sess_id_clone.clone(), final_session.clone());
+            drop(hist);
 
             // Notify all waiters in stop_mirror that state recording is complete
             completed_clone.notify_waiters();

@@ -59,6 +59,32 @@ impl AuthConfig {
             })?;
         }
 
+        // On Windows, use icacls to restrict token file to current user only.
+        // This removes inherited permissions and grants only the current user Full Control,
+        // mirroring the Unix 0600 protection model.
+        #[cfg(windows)]
+        {
+            let path_str = token_path.to_string_lossy();
+            // Step 1: Remove all inherited ACEs (icacls /inheritance:r)
+            let _ = std::process::Command::new("icacls")
+                .args([path_str.as_ref(), "/inheritance:r"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            // Step 2: Grant only current user Full Control
+            if let Ok(username) = env::var("USERNAME") {
+                let grant_arg = format!("{}:F", username);
+                let _ = std::process::Command::new("icacls")
+                    .args([path_str.as_ref(), "/grant:r", grant_arg.as_str()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            // Note: icacls errors are non-fatal (best-effort); the token is still required for auth.
+        }
+
         Ok(Self { token, token_path })
     }
 
