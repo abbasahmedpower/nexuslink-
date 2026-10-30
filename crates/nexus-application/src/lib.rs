@@ -1,12 +1,33 @@
 use async_trait::async_trait;
-use nexus_adapter_kde::KdeAdapter;
-use nexus_adapter_scrcpy::{ScrcpySupervisor, SessionEvent};
 use nexus_domain::{
-    DaemonCapabilities, DeviceInfo, DiscoveredPeerInfo, DomainError, StreamSession,
+    DaemonCapabilities, DeviceInfo, DiscoveredPeerInfo, DomainError, SessionEvent, StreamSession,
     PROTOCOL_VERSION,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+#[async_trait]
+pub trait KdePort: Send + Sync {
+    async fn list_devices(&self) -> Result<Vec<DeviceInfo>, DomainError>;
+    async fn pair_device(&self, device_id: &str) -> Result<String, DomainError>;
+    async fn ping_device(&self, device_id: &str) -> Result<String, DomainError>;
+    async fn share_file(&self, device_id: &str, file_or_url: &str) -> Result<String, DomainError>;
+    async fn check_available(&self) -> bool;
+}
+
+#[async_trait]
+pub trait ScrcpyPort: Send + Sync {
+    async fn start_mirror(
+        &self,
+        serial: Option<String>,
+        camera: bool,
+        record: Option<String>,
+    ) -> Result<StreamSession, DomainError>;
+    async fn stop_mirror(&self, session_id: Option<String>) -> Result<StreamSession, DomainError>;
+    async fn get_active_session(&self) -> Option<StreamSession>;
+    async fn check_available(&self) -> bool;
+    fn subscribe(&self) -> broadcast::Receiver<SessionEvent>;
+}
 
 #[async_trait]
 pub trait DiscoveryProvider: Send + Sync {
@@ -15,13 +36,13 @@ pub trait DiscoveryProvider: Send + Sync {
 
 #[derive(Clone)]
 pub struct HubApplication {
-    kde: Arc<dyn KdeAdapter>,
-    scrcpy: Arc<dyn ScrcpySupervisor>,
+    kde: Arc<dyn KdePort>,
+    scrcpy: Arc<dyn ScrcpyPort>,
     discovery: Option<Arc<dyn DiscoveryProvider>>,
 }
 
 impl HubApplication {
-    pub fn new(kde: Arc<dyn KdeAdapter>, scrcpy: Arc<dyn ScrcpySupervisor>) -> Self {
+    pub fn new(kde: Arc<dyn KdePort>, scrcpy: Arc<dyn ScrcpyPort>) -> Self {
         Self {
             kde,
             scrcpy,

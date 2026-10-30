@@ -1,10 +1,11 @@
 [package]
 name = "nexus-adapter-scrcpy"
-version = "0.4.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
 nexus-domain = { path = "../nexus-domain" }
+nexus-application = { path = "../nexus-application" }
 tokio = { version = "1", features = ["process", "sync", "time"] }
 tracing = "0.1"
 async-trait = "0.1"

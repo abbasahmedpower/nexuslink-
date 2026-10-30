@@ -1,6 +1,6 @@
 name: nexus_hub
-version: 0.1.0+1
-description: Local-first multi-device dashboard starter
+version: 1.0.0+1
+description: NexusLink Universal Device Integration Platform Dashboard
 publish_to: none
 environment:
   sdk: '>=3.3.0 <4.0.0'

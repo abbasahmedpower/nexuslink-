@@ -51,11 +51,11 @@ impl DiscoveryProvider for PeerStoreDiscovery {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
-    info!("Nexus Hub v0.4 starting...");
+    info!("NexusLink Hub v1.0.0 starting...");
 
     let id = env::var("NEXUS_DEVICE_ID")
         .unwrap_or_else(|_| format!("nexus-session-{}-{}", std::process::id(), now_ms()));
-    let name =
+    let _name =
         env::var("NEXUS_DEVICE_NAME").unwrap_or_else(|_| "Nexus Desktop (discovery only)".into());
     let peers = Arc::new(RwLock::new(peers::PeerStore::default()));
 
@@ -82,58 +82,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
-    // 3. Backward-compatible LAN passive discovery (optional, untrusted)
-    let udp = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, protocol::KDE_PORT)).await?);
-    udp.set_broadcast(true)?;
-
-    let listener = {
-        let socket = udp.clone();
-        let state = peers.clone();
-        let own_id = id.clone();
-        tokio::spawn(async move {
-            let mut buf = [0_u8; protocol::MAX_DATAGRAM];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, source)) => {
-                        if let Some(identity) = protocol::parse_identity(&buf[..n]) {
-                            if identity.device_id != own_id {
-                                state
-                                    .write()
-                                    .await
-                                    .observe(identity, source.ip(), Instant::now());
+    // 3. Passive LAN discovery (receive-only; does not collide or broadcast fake identity)
+    let listener = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, protocol::KDE_PORT)).await {
+        Ok(udp) => {
+            let _ = udp.set_broadcast(true);
+            let socket = Arc::new(udp);
+            let state = peers.clone();
+            let own_id = id.clone();
+            info!(
+                "Passive LAN discovery listener active on UDP port {}",
+                protocol::KDE_PORT
+            );
+            Some(tokio::spawn(async move {
+                let mut buf = [0_u8; protocol::MAX_DATAGRAM];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((n, source)) => {
+                            if let Some(identity) = protocol::parse_identity(&buf[..n]) {
+                                if identity.device_id != own_id {
+                                    state.write().await.observe(
+                                        identity,
+                                        source.ip(),
+                                        Instant::now(),
+                                    );
+                                }
                             }
                         }
+                        Err(e) => warn!("Discovery receive error: {e}"),
                     }
-                    Err(e) => warn!("Discovery receive error: {e}"),
                 }
-            }
-        })
-    };
-
-    let broadcaster = {
-        let socket = udp.clone();
-        tokio::spawn(async move {
-            let mut ticker = time::interval(Duration::from_secs(10));
-            loop {
-                ticker.tick().await;
-                let payload = format!(
-                    "{}\n",
-                    json!({"id": now_ms(), "type":"kdeconnect.identity", "body": {
-                        "deviceId": id, "deviceName": name, "deviceType": "laptop", "protocolVersion": protocol::PROTOCOL_VERSION,
-                        "tcpPort": protocol::KDE_PORT, "incomingCapabilities": [], "outgoingCapabilities": []
-                    }})
-                );
-                if let Err(e) = socket
-                    .send_to(
-                        payload.as_bytes(),
-                        (Ipv4Addr::BROADCAST, protocol::KDE_PORT),
-                    )
-                    .await
-                {
-                    warn!("Broadcast failed: {e}");
-                }
-            }
-        })
+            }))
+        }
+        Err(e) => {
+            warn!(
+                "Passive UDP listener could not bind to port {}: {}. Real KDE Connect daemon or another process is running; LAN discovery will defer to kdeconnect-cli.",
+                protocol::KDE_PORT, e
+            );
+            None
+        }
     };
 
     // 4. Insecure legacy HTTP server (disabled by default; strictly opt-in)
@@ -189,12 +175,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     tokio::signal::ctrl_c().await?;
-    info!("Shutting down Nexus Hub v0.4...");
+    info!("Shutdown signal received. Terminating NexusLink Hub v1.0.0 gracefully...");
+
+    // Stop active scrcpy session if running
+    if let Some(sess) = app.get_active_session().await {
+        if sess.state == nexus_domain::SessionState::Running {
+            info!("Stopping active streaming session {}...", sess.session_id);
+            let _ = tokio::time::timeout(Duration::from_secs(3), app.stop_mirror(None)).await;
+        }
+    }
+
     ipc_task.abort();
-    listener.abort();
-    broadcaster.abort();
+    if let Some(task) = listener {
+        task.abort();
+    }
     if let Some(task) = api_task {
         task.abort();
     }
+    info!("NexusLink Hub v1.0.0 shutdown complete.");
     Ok(())
 }

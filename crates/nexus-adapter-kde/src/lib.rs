@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use nexus_application::KdePort;
 use nexus_domain::{
     is_valid_device_id, DeviceInfo, DeviceOrigin, DomainError, ErrorCode, MAX_OUTPUT_CAPTURE_SIZE,
 };
@@ -8,14 +9,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-#[async_trait]
-pub trait KdeAdapter: Send + Sync {
-    async fn list_devices(&self) -> Result<Vec<DeviceInfo>, DomainError>;
-    async fn pair_device(&self, device_id: &str) -> Result<String, DomainError>;
-    async fn ping_device(&self, device_id: &str) -> Result<String, DomainError>;
-    async fn share_file(&self, device_id: &str, file_or_url: &str) -> Result<String, DomainError>;
-    async fn check_available(&self) -> bool;
-}
+/// Re-export KdePort as KdeAdapter for backwards compatibility if needed.
+pub use nexus_application::KdePort as KdeAdapter;
 
 #[derive(Clone)]
 pub struct CliKdeAdapter {
@@ -61,13 +56,22 @@ impl CliKdeAdapter {
         let run_fut = async {
             let mut out_buf = Vec::new();
             let mut err_buf = Vec::new();
-            let (r1, r2, status) = tokio::join!(
-                stdout_pipe.read_to_end(&mut out_buf),
-                stderr_pipe.read_to_end(&mut err_buf),
-                child.wait()
-            );
-            r1.map_err(|e| e.to_string())?;
-            r2.map_err(|e| e.to_string())?;
+
+            let drain_stdout = async {
+                let mut limited = (&mut stdout_pipe).take(MAX_OUTPUT_CAPTURE_SIZE as u64);
+                let _ = limited.read_to_end(&mut out_buf).await;
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut stdout_pipe, &mut sink).await;
+            };
+
+            let drain_stderr = async {
+                let mut limited = (&mut stderr_pipe).take(MAX_OUTPUT_CAPTURE_SIZE as u64);
+                let _ = limited.read_to_end(&mut err_buf).await;
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut stderr_pipe, &mut sink).await;
+            };
+
+            let ((), (), status) = tokio::join!(drain_stdout, drain_stderr, child.wait());
             let status = status.map_err(|e| e.to_string())?;
             Ok::<_, String>((status, out_buf, err_buf))
         };
@@ -117,7 +121,7 @@ impl CliKdeAdapter {
 }
 
 #[async_trait]
-impl KdeAdapter for CliKdeAdapter {
+impl KdePort for CliKdeAdapter {
     async fn check_available(&self) -> bool {
         let mut cmd = Command::new(&self.executable);
         cmd.arg("--version")

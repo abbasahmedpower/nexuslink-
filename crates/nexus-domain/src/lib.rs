@@ -60,6 +60,7 @@ pub enum SessionState {
     Stopping,
     Stopped,
     Failed,
+    TerminationUnconfirmed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -50,10 +50,23 @@ class _DashboardState extends State<Dashboard> {
     Icons.info_outline
   ];
 
+  Future<void> refreshSession() async {
+    final sess = await ipc.getSession();
+    if (!mounted) return;
+    setState(() {
+      if (sess != null && sess.state == 'running') {
+        activeSession = sess;
+      } else {
+        activeSession = null;
+      }
+    });
+  }
+
   @override
   void initState() {
     super.initState();
     refreshDiscovery();
+    refreshSession();
     timer = Timer.periodic(const Duration(seconds: 8), (_) => refreshDiscovery());
 
     // Listen to streaming events from the Rust supervisor
@@ -61,6 +74,11 @@ class _DashboardState extends State<Dashboard> {
       if (!mounted) return;
       final type = event['event'] as String?;
       final data = event['data'];
+      if (type == 'resync_required') {
+        refreshDiscovery();
+        refreshSession();
+        return;
+      }
       setState(() {
         if (type == 'session_started') {
           activeSession = StreamSession.fromJson(data as Map<String, dynamic>);

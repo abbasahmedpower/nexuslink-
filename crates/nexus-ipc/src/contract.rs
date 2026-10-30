@@ -78,6 +78,9 @@ pub enum IpcNotification {
         session_id: String,
         error: String,
     },
+    ResyncRequired {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

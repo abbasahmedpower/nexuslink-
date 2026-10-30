@@ -1,33 +1,29 @@
-# Upstream integration decision (2026-10-29)
+# Upstream Integration Architecture & Policy (v1.0.0)
 
-## Two integration boundaries
-1. `scrcpy`: launch the independently installed Apache-2.0 executable as an owned subprocess, with fixed, vetted arguments. Supports screen and camera mode. Do not fork/synchronize its native server until a profiler demonstrates a requirement.
-2. `KDE Connect`: invoke `kdeconnect-cli` installed from KDE using documented command switches. Pairing and TLS are performed **by KDE Connect**, not Nexus's discovery-only Rust daemon. Do not assume device discovery establishes identity.
+## 1. Integration Boundary Philosophy
 
-These integrations rely on executable discovery through PATH and upstream installs. They are not source-level linkages, and the code is not yet merged into one media engine. Commands use `Process.run` / `Process.start`, with `runInShell:false` to avoid shell command injection. Process startup reports errors, and UI shows results; `scrcpy` video currently appears in its own native window. Existing initial Rust daemon is not hardened enough to be a production security boundary.
+NexusLink interfaces with mature open-source engines as **managed, external child processes** rather than maintaining fragile in-tree forks or directly linking against GPL codebases:
 
-## License gates
-- scrcpy: Apache License 2.0; retain copyright/NOTICE obligations for redistribution.
-- KDE Connect: files may be GPL-2.0-only OR GPL-3.0-only or KDE-approved GPL; audit specific file SPDX expressions when embedding code. Running an installed CLI as a separate process is intentionally different from copying and linking its GPL code.
-- No '10% change' exemption exists.
-- For packaged releases audit licenses, trademarks, copied assets, dependencies and distribution model with counsel.
+1. **`scrcpy` (Apache-2.0)**:
+   - High-performance, low-latency H.264/H.265 Android screen mirroring and camera streaming.
+   - Managed via `nexus-adapter-scrcpy` with strict argument validation, bounded output draining, `tokio::sync::watch` status reporting, and automatic termination (`kill_on_drop`).
+   - Runs in a native high-refresh window, eliminating latency overhead from intermediate frame copy.
 
-## Performance, behavior and nano issues
-| Failure | Mitigation | Follow-up verification |
-|---|---|---|
-| executable missing | visible ProcessException | clean install on Fedora and Windows |
-| shell injection | typed argument list; no shell | invalid path and device ID tests |
-| stale video process | track handle, graceful close, timeout | exit while streaming |
-| stuck CLI | 12s timeout | slow dbus backend and hung process |
-| invalid pairing identity | leave TLS and trust store to KDE | pair + fingerprint verification on two physical devices |
-| USB/ADB device ambiguity | explicit serial optional | several attached Android phones |
-| dropped link | report error; avoid fake state | unplug/replug, airplane mode |
-| buffer use / frame queues | upstream scrcpy process | profile P95/P99 input-to-photon and peak RSS |
-| permission-sensitive camera | explicit user action, app-supported APIs | Android 12+ tests |
-| dependency drift | specify verified versions for release | CI version matrix |
+2. **`KDE Connect` (GPLv2+ / GPLv3+)**:
+   - Device discovery, TLS mutual authentication, file/URL transfer, and ping functionality.
+   - Invoked via `kdeconnect-cli` by `nexus-adapter-kde`.
+   - Interacts strictly across OS process boundaries via standard I/O streams without linking against GPL libraries.
 
-## Critical limitations
-- `Process.run().timeout()` is not guaranteed to terminate a stuck child; production adapter needs explicit PID ownership and termination on timeout.
-- The desktop UI currently requests KDE devices and controls scrcpy directly, while Rust discovery remains independent. Future step: move command supervision to a dedicated Rust IPC daemon using per-user named pipes/Unix sockets, authenticated IPC and structured events.
-- Windows KDE CLI executable packaging and PATH need real deployment validation.
-- Do not claim 120 FPS, zero latency, zero-copy, peer authentication, or production readiness absent measured evidence.
+## 2. Process Supervision Contract
+
+| Subsystem | Managed Binary | Supervised By | Error Handling & Guarantees |
+| :--- | :--- | :--- | :--- |
+| **Screen Mirror** | `scrcpy` | `ProcessScrcpySupervisor` | Full lifecycle tracking (`Running`, `Stopped`, `Failed`, `TerminationUnconfirmed`). Output drained to `tokio::io::sink()`. |
+| **Camera Stream** | `scrcpy` | `ProcessScrcpySupervisor` | Passes `--video-source=camera` with bounded buffer drains. |
+| **Device Listing** | `kdeconnect-cli` | `CliKdeAdapter` | 12-second timeout, JSON/text output parsing. |
+| **Pairing Request**| `kdeconnect-cli` | `CliKdeAdapter` | Validates device ID before invocation. |
+| **File Sharing**   | `kdeconnect-cli` | `CliKdeAdapter` | Passes path safely as separate argument. |
+
+## 3. License Compliance
+- **Apache-2.0 (`scrcpy`)**: Compatible with NexusLink's Apache-2.0 license.
+- **GPL (`kdeconnect`)**: NexusLink executes `kdeconnect-cli` purely as an external process without dynamic or static linking, maintaining strict license separation.

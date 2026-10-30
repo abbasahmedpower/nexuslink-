@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
@@ -14,6 +15,8 @@ use tracing::{info, warn};
 
 pub const IPC_TCP_FALLBACK_PORT: u16 = 8788;
 pub const MAX_CLIENTS: usize = 8;
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Manages per-user session token stored in user's protected runtime/appdata directory
 pub struct AuthConfig {
@@ -116,7 +119,10 @@ impl AuthConfig {
         if let Ok(profile) = env::var("USERPROFILE") {
             return Ok(PathBuf::from(profile).join(".nexus_hub").join("run"));
         }
-        Ok(env::temp_dir().join("nexus_hub_run"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Could not determine a secure user runtime directory (USERPROFILE/HOME/LOCALAPPDATA/XDG_RUNTIME_DIR not set). Refusing insecure shared fallback.",
+        ))
     }
 }
 
@@ -220,20 +226,122 @@ impl IpcServer {
                 let mut authenticated = false;
                 let mut event_sub: Option<broadcast::Receiver<SessionEvent>> = None;
 
+                // 1. Enforce strict handshake deadline (5 seconds)
+                let auth_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+                    let line = match read_bounded_frame(&mut reader, MAX_IPC_FRAME_SIZE).await {
+                        Ok(Some(l)) => l,
+                        Ok(None) => {
+                            return Err(DomainError::new(
+                                ErrorCode::IpcAuthenticationRequired,
+                                "Connection closed before handshake",
+                            ));
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    let wire_req: WireMessage = match serde_json::from_str(&line) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Err(DomainError::new(
+                                ErrorCode::InvalidRequest,
+                                format!("JSON parse error during handshake: {}", e),
+                            ));
+                        }
+                    };
+
+                    let req = match wire_req.body {
+                        WireMessageBody::Request(r) => r,
+                        _ => {
+                            return Err(DomainError::new(
+                                ErrorCode::InvalidRequest,
+                                "Expected handshake request",
+                            ));
+                        }
+                    };
+
+                    let (resp, subscribe) =
+                        Self::handle_request(&app, &auth, &mut authenticated, req).await;
+                    if subscribe {
+                        event_sub = Some(app.subscribe_events());
+                    }
+
+                    let wire_resp = WireMessage {
+                        id: wire_req.id,
+                        body: WireMessageBody::Response(resp),
+                    };
+
+                    if let Ok(serialized) = serde_json::to_string(&wire_resp) {
+                        if serialized.len() <= MAX_IPC_FRAME_SIZE {
+                            let _ = writer
+                                .write_all(format!("{}\n", serialized).as_bytes())
+                                .await;
+                        }
+                    }
+
+                    if !authenticated {
+                        return Err(DomainError::new(
+                            ErrorCode::IpcAuthenticationRequired,
+                            "Authentication failed",
+                        ));
+                    }
+                    Ok(())
+                })
+                .await;
+
+                match auth_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("IPC handshake failed for {}: {}", peer_addr, e.message);
+                        let err_resp = WireMessage {
+                            id: 0,
+                            body: WireMessageBody::Response(IpcResponse::err(e)),
+                        };
+                        if let Ok(s) = serde_json::to_string(&err_resp) {
+                            if s.len() <= MAX_IPC_FRAME_SIZE {
+                                let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                            }
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("IPC handshake timed out after 5s for {}", peer_addr);
+                        let err_resp = WireMessage {
+                            id: 0,
+                            body: WireMessageBody::Response(IpcResponse::err(DomainError::new(
+                                ErrorCode::IpcAuthenticationRequired,
+                                "Handshake deadline timed out after 5 seconds",
+                            ))),
+                        };
+                        if let Ok(s) = serde_json::to_string(&err_resp) {
+                            if s.len() <= MAX_IPC_FRAME_SIZE {
+                                let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // 2. Authenticated command loop with idle timeout and outbound limits
                 loop {
                     tokio::select! {
-                        frame_res = read_bounded_frame(&mut reader, MAX_IPC_FRAME_SIZE) => {
+                        frame_res = tokio::time::timeout(IDLE_TIMEOUT, read_bounded_frame(&mut reader, MAX_IPC_FRAME_SIZE)) => {
                             let line = match frame_res {
-                                Ok(Some(l)) => l,
-                                Ok(None) => break, // EOF
-                                Err(e) => {
+                                Ok(Ok(Some(l))) => l,
+                                Ok(Ok(None)) => break, // EOF
+                                Ok(Err(e)) => {
                                     let err_resp = WireMessage {
                                         id: 0,
                                         body: WireMessageBody::Response(IpcResponse::err(e)),
                                     };
                                     if let Ok(s) = serde_json::to_string(&err_resp) {
-                                        let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        if s.len() <= MAX_IPC_FRAME_SIZE {
+                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        }
                                     }
+                                    break;
+                                }
+                                Err(_) => {
+                                    info!("IPC client {} idle timeout reached (60s), closing", peer_addr);
                                     break;
                                 }
                             };
@@ -249,7 +357,9 @@ impl IpcServer {
                                         ))),
                                     };
                                     if let Ok(s) = serde_json::to_string(&err_resp) {
-                                        let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        if s.len() <= MAX_IPC_FRAME_SIZE {
+                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        }
                                     }
                                     continue;
                                 }
@@ -271,7 +381,19 @@ impl IpcServer {
                             };
 
                             if let Ok(serialized) = serde_json::to_string(&wire_resp) {
-                                if let Err(e) = writer.write_all(format!("{}\n", serialized).as_bytes()).await {
+                                if serialized.len() > MAX_IPC_FRAME_SIZE {
+                                    warn!("IPC response exceeded MAX_IPC_FRAME_SIZE; rejecting outbound frame");
+                                    let err_resp = WireMessage {
+                                        id: wire_req.id,
+                                        body: WireMessageBody::Response(IpcResponse::err(DomainError::new(
+                                            ErrorCode::PayloadTooLarge,
+                                            format!("Response payload exceeds maximum allowed frame size of {} bytes", MAX_IPC_FRAME_SIZE),
+                                        ))),
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&err_resp) {
+                                        let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                    }
+                                } else if let Err(e) = writer.write_all(format!("{}\n", serialized).as_bytes()).await {
                                     warn!("Failed to write IPC response: {}", e);
                                     break;
                                 }
@@ -296,10 +418,25 @@ impl IpcServer {
                                         body: WireMessageBody::Notification(notif),
                                     };
                                     if let Ok(s) = serde_json::to_string(&wire_notif) {
-                                        let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        if s.len() <= MAX_IPC_FRAME_SIZE {
+                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        }
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                                    warn!("Client lagged, missed {} events; sending resync notification", missed);
+                                    let wire_notif = WireMessage {
+                                        id: 0,
+                                        body: WireMessageBody::Notification(IpcNotification::ResyncRequired {
+                                            reason: format!("Event queue lagged, missed {} events", missed),
+                                        }),
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&wire_notif) {
+                                        if s.len() <= MAX_IPC_FRAME_SIZE {
+                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                        }
+                                    }
+                                }
                                 Err(broadcast::error::RecvError::Closed) => {
                                     event_sub = None;
                                 }

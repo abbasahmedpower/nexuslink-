@@ -124,10 +124,26 @@ class NexusIpcClient {
     return null;
   }
 
+  Future<void>? _connectingFuture;
+
   Future<void> connect() async {
     if (_socket != null) return;
-    _socket = await Socket.connect(host, port, timeout: const Duration(seconds: 3));
-    _socket!.transform(utf8.decoder).transform(const LineSplitter()).listen(
+    if (_connectingFuture != null) {
+      await _connectingFuture;
+      return;
+    }
+    _connectingFuture = _doConnect();
+    try {
+      await _connectingFuture;
+    } finally {
+      _connectingFuture = null;
+    }
+  }
+
+  Future<void> _doConnect() async {
+    final s = await Socket.connect(host, port, timeout: const Duration(seconds: 3));
+    _socket = s;
+    s.transform(utf8.decoder).transform(const LineSplitter()).listen(
       _onLine,
       onError: (err) {
         _cleanup();
@@ -148,7 +164,7 @@ class NexusIpcClient {
     if (res['status'] != 'ok') {
       final err = res['error']?['message'] ?? 'Authentication failed';
       _cleanup();
-      throw Exception('IPC handshake rejected: $err');
+      throw Exception('IPC handshake rejected: ' + err.toString());
     }
 
     // Subscribe to daemon events

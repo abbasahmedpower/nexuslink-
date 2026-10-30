@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use nexus_application::ScrcpyPort;
 pub use nexus_domain::SessionEvent;
 use nexus_domain::{
     is_valid_device_id, DomainError, ErrorCode, SessionState, StreamKind, StreamSession,
@@ -11,33 +12,22 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, watch, Mutex, Notify};
 use tracing::{info, warn};
 
 /// Maximum bytes we'll buffer from child stdout/stderr to prevent memory exhaustion.
 const MAX_CHILD_OUTPUT: usize = 65_536; // 64 KiB
 
-#[async_trait]
-pub trait ScrcpySupervisor: Send + Sync {
-    async fn start_mirror(
-        &self,
-        serial: Option<String>,
-        camera: bool,
-        record: Option<String>,
-    ) -> Result<StreamSession, DomainError>;
-    async fn stop_mirror(&self, session_id: Option<String>) -> Result<StreamSession, DomainError>;
-    async fn get_active_session(&self) -> Option<StreamSession>;
-    async fn check_available(&self) -> bool;
-    fn subscribe(&self) -> broadcast::Receiver<SessionEvent>;
-}
+/// Backwards compatibility alias for ScrcpyPort
+pub use nexus_application::ScrcpyPort as ScrcpySupervisor;
 
 /// Session metadata stored under the session mutex — never contains the Child handle.
 struct SessionInfo {
     session: StreamSession,
     /// Notify used to signal the monitor task to kill the child and shut down.
     kill_signal: Arc<Notify>,
-    /// Notify used by the monitor task to broadcast that termination and state recording is complete.
-    completed: Arc<Notify>,
+    /// Watch receiver used to observe termination completion reliably without lost wakeups.
+    completed_rx: watch::Receiver<Option<StreamSession>>,
 }
 
 /// Maximum number of completed sessions kept in history to prevent unbounded memory growth.
@@ -80,7 +70,7 @@ impl ProcessScrcpySupervisor {
 }
 
 #[async_trait]
-impl ScrcpySupervisor for ProcessScrcpySupervisor {
+impl ScrcpyPort for ProcessScrcpySupervisor {
     async fn check_available(&self) -> bool {
         let mut cmd = Command::new(&self.executable);
         cmd.arg("--version")
@@ -159,7 +149,8 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -191,12 +182,12 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
         };
 
         let kill_signal = Arc::new(Notify::new());
-        let completed = Arc::new(Notify::new());
+        let (completed_tx, completed_rx) = watch::channel::<Option<StreamSession>>(None);
 
         *lock = Some(SessionInfo {
             session: session.clone(),
             kill_signal: kill_signal.clone(),
-            completed: completed.clone(),
+            completed_rx: completed_rx.clone(),
         });
         drop(lock); // Release lock BEFORE spawning monitor task
 
@@ -211,7 +202,6 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
         let history_clone = self.history.clone();
         let events_clone = self.events.clone();
         let sess_id_clone = session_id.clone();
-        let completed_clone = completed.clone();
         let session_snapshot = session.clone();
 
         tokio::spawn(async move {
@@ -222,19 +212,25 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
             let mut out_buf = Vec::new();
             let mut err_buf = Vec::new();
 
-            // Drain stdout/stderr with bounded memory while waiting for child or kill signal
+            let mut stdout = stdout_pipe;
+            let mut stderr = stderr_pipe;
+
+            // Drain stdout/stderr continuously with bounded memory capture while waiting for child or kill signal
             let monitor_result = tokio::select! {
                 result = async {
-                    let drain = async {
-                        let mut stdout_limited = stdout_pipe.take(MAX_CHILD_OUTPUT as u64);
-                        let mut stderr_limited = stderr_pipe.take(MAX_CHILD_OUTPUT as u64);
-                        let _ = tokio::join!(
-                            stdout_limited.read_to_end(&mut out_buf),
-                            stderr_limited.read_to_end(&mut err_buf)
-                        );
+                    let drain_stdout = async {
+                        let mut limited = (&mut stdout).take(MAX_CHILD_OUTPUT as u64);
+                        let _ = limited.read_to_end(&mut out_buf).await;
+                        let mut sink = tokio::io::sink();
+                        let _ = tokio::io::copy(&mut stdout, &mut sink).await;
                     };
-                    let wait = child.wait();
-                    let (_, wait_result) = tokio::join!(drain, wait);
+                    let drain_stderr = async {
+                        let mut limited = (&mut stderr).take(MAX_CHILD_OUTPUT as u64);
+                        let _ = limited.read_to_end(&mut err_buf).await;
+                        let mut sink = tokio::io::sink();
+                        let _ = tokio::io::copy(&mut stderr, &mut sink).await;
+                    };
+                    let ((), (), wait_result) = tokio::join!(drain_stdout, drain_stderr, child.wait());
                     wait_result
                 } => {
                     result
@@ -308,7 +304,6 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
             // Save to history with bounded size (MAX_HISTORY) — monitor task is the single source of truth for session completion
             let mut hist = history_clone.lock().await;
             if hist.len() >= MAX_HISTORY {
-                // Prune oldest entry by earliest started_at_ms (O(n) but history cap keeps it fast)
                 if let Some(oldest_key) = hist
                     .iter()
                     .min_by_key(|(_, s)| s.started_at_ms)
@@ -320,8 +315,8 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
             hist.insert(sess_id_clone.clone(), final_session.clone());
             drop(hist);
 
-            // Notify all waiters in stop_mirror that state recording is complete
-            completed_clone.notify_waiters();
+            // Notify all waiters via watch channel — prevents lost wakeups!
+            let _ = completed_tx.send(Some(final_session.clone()));
 
             // Send broadcast events
             if let Some(err) = err_msg {
@@ -353,7 +348,7 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
     }
 
     async fn stop_mirror(&self, session_id: Option<String>) -> Result<StreamSession, DomainError> {
-        let (kill_signal, completed, sid) = {
+        let (kill_signal, mut completed_rx, sid, original_session) = {
             let lock = self.active.lock().await;
             match *lock {
                 Some(ref info) => {
@@ -376,8 +371,9 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
                     }
                     (
                         info.kill_signal.clone(),
-                        info.completed.clone(),
+                        info.completed_rx.clone(),
                         info.session.session_id.clone(),
+                        info.session.clone(),
                     )
                 }
                 None => {
@@ -399,20 +395,23 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
         // Signal monitor task to terminate child
         kill_signal.notify_one();
 
-        // Await confirmation from the monitor task (up to 4s safeguard deadline)
-        match tokio::time::timeout(Duration::from_secs(4), completed.notified()).await {
-            Ok(()) => {
-                let hist = self.history.lock().await;
-                if let Some(s) = hist.get(&sid) {
-                    return Ok(s.clone());
+        // Await confirmation from the monitor task (up to 4s safeguard deadline) via watch channel
+        let wait_result = tokio::time::timeout(Duration::from_secs(4), async {
+            // If already completed before we began waiting, borrow will have Some
+            if let Some(ref s) = *completed_rx.borrow() {
+                return Some(s.clone());
+            }
+            while completed_rx.changed().await.is_ok() {
+                if let Some(ref s) = *completed_rx.borrow() {
+                    return Some(s.clone());
                 }
             }
-            Err(_) => {
-                warn!(
-                    "Stop requested but termination confirmation timed out for {}",
-                    sid
-                );
-            }
+            None
+        })
+        .await;
+
+        if let Ok(Some(s)) = wait_result {
+            return Ok(s);
         }
 
         // Safeguard fallback: check history once more
@@ -421,16 +420,10 @@ impl ScrcpySupervisor for ProcessScrcpySupervisor {
             return Ok(s.clone());
         }
 
-        let fallback = StreamSession {
-            session_id: sid.clone(),
-            kind: StreamKind::Screen,
-            device_serial: None,
-            state: SessionState::Stopped,
-            started_at_ms: Self::now_ms(),
-            pid: None,
-            exit_code: None,
-            last_error: Some("Termination confirmation timed out".to_string()),
-        };
+        // Truthful fallback: Preserve original session kind, serial, PID, but mark as TerminationUnconfirmed
+        let mut fallback = original_session;
+        fallback.state = SessionState::TerminationUnconfirmed;
+        fallback.last_error = Some("Termination confirmation timed out".to_string());
         hist.insert(sid, fallback.clone());
         Ok(fallback)
     }

@@ -3,6 +3,7 @@ use serde_json::Value;
 
 pub const MAX_DATAGRAM: usize = 8192;
 pub const KDE_PORT: u16 = 1716;
+#[allow(dead_code)]
 pub const PROTOCOL_VERSION: u32 = 7; // Compatibility hypothesis; test against real peer.
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
