@@ -8,6 +8,15 @@ pub enum IpcRequest {
         protocol_version: u32,
         client_name: String,
         auth_token: Option<String>,
+        #[serde(default)]
+        codec: Option<String>,
+    },
+    /// Negotiate the wire codec for the rest of the session. Only valid after
+    /// authentication; like `SubscribeEvents`, it is idempotent and safe to
+    /// re-send (e.g. after a transport hiccup) — the server always answers in
+    /// the codec that was used for the request itself, then switches.
+    NegotiateCodec {
+        codec: String,
     },
     GetCapabilities,
     GetDiscoveryPeers,
