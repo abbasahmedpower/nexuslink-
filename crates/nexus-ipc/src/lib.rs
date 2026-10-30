@@ -1,4 +1,7 @@
 pub mod contract;
+pub mod wire;
+
+pub use wire::{decode as decode_frame, encode as encode_frame, sniff_codec, WireCodec};
 
 use contract::{IpcNotification, IpcRequest, IpcResponse, WireMessage, WireMessageBody};
 use nexus_application::HubApplication;
@@ -10,8 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{info, warn};
+use wire::WireCodec;
+
+/// Result of handling a request: `(response, wants_event_subscription, negotiated_codec)`.
+type HandleResult = (IpcResponse, bool, Option<WireCodec>);
 
 pub const IPC_TCP_FALLBACK_PORT: u16 = 8788;
 pub const MAX_CLIENTS: usize = 8;
@@ -126,20 +133,30 @@ impl AuthConfig {
     }
 }
 
-/// Reads a single line from the buffered reader with strict memory allocation bounds.
-/// Guarantees that buffer size never exceeds `max_len`, preventing memory exhaustion from unclosed lines.
+/// Reads one complete inbound frame from the stream with strict memory
+/// allocation bounds and codec-aware framing.
+///
+/// Framing rules (both formats are bounded by `max_len` *before* parsing):
+/// - JSON frames: NDJSON line, terminated by `\n` (a trailing `\r` is stripped).
+/// - Binary frames (`bincode1`): start with `BINCODE_TAG` (0xB1), which can
+///   never appear at the start of a valid JSON document, so the format is
+///   self-identifying; the frame ends at the next `\n` (appended by the writer
+///   for transport consistency) or at EOF.
+///
+/// Guarantees: the returned buffer never exceeds `max_len`, preventing memory
+/// exhaustion from unclosed or oversized lines.
 async fn read_bounded_frame<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     max_len: usize,
-) -> Result<Option<String>, DomainError> {
-    let mut buf = Vec::new();
+) -> Result<Option<Vec<u8>>, DomainError> {
+    let mut buf: Vec<u8> = Vec::new();
     loop {
         let available = match reader.fill_buf().await {
             Ok([]) => {
                 if buf.is_empty() {
                     return Ok(None); // EOF
                 } else {
-                    break;
+                    break; // EOF mid-frame (binary framing tolerates missing newline)
                 }
             }
             Ok(b) => b,
@@ -175,9 +192,15 @@ async fn read_bounded_frame<R: tokio::io::AsyncBufRead + Unpin>(
     if buf.ends_with(b"\r") {
         buf.pop();
     }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|e| DomainError::new(ErrorCode::InvalidRequest, format!("Invalid UTF-8: {}", e)))
+    Ok(Some(buf))
+}
+
+/// Writes an encoded frame to the transport. Encoders already guarantee the
+/// frame fits within `MAX_IPC_FRAME_SIZE`, so this is a single bounded write
+/// with no extra concatenation copy.
+async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_all(bytes).await?;
+    writer.flush().await
 }
 
 pub struct IpcServer {
@@ -225,11 +248,16 @@ impl IpcServer {
                 let mut reader = BufReader::new(reader);
                 let mut authenticated = false;
                 let mut event_sub: Option<broadcast::Receiver<SessionEvent>> = None;
+                // Outbound codec state, shared with the writer half of the
+                // command loop below. Negotiated during handshake; JSON until
+                // a successful bincode1 negotiation.
+                let codec = Arc::new(Mutex::new(WireCodec::Json));
 
-                // 1. Enforce strict handshake deadline (5 seconds)
+                // 1. Enforce strict handshake deadline (5 seconds).
+                //    The handshake itself is always JSON for interoperability.
                 let auth_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-                    let line = match read_bounded_frame(&mut reader, MAX_IPC_FRAME_SIZE).await {
-                        Ok(Some(l)) => l,
+                    let frame = match read_bounded_frame(&mut reader, MAX_IPC_FRAME_SIZE).await {
+                        Ok(Some(f)) => f,
                         Ok(None) => {
                             return Err(DomainError::new(
                                 ErrorCode::IpcAuthenticationRequired,
@@ -239,12 +267,12 @@ impl IpcServer {
                         Err(e) => return Err(e),
                     };
 
-                    let wire_req: WireMessage = match serde_json::from_str(&line) {
+                    let wire_req: WireMessage = match wire::decode(&frame) {
                         Ok(m) => m,
                         Err(e) => {
                             return Err(DomainError::new(
                                 ErrorCode::InvalidRequest,
-                                format!("JSON parse error during handshake: {}", e),
+                                format!("Handshake frame decode error: {}", e.message),
                             ));
                         }
                     };
@@ -259,23 +287,25 @@ impl IpcServer {
                         }
                     };
 
-                    let (resp, subscribe) =
+                    let (resp, _subscribe, requested_codec) =
                         Self::handle_request(&app, &auth, &mut authenticated, req).await;
-                    if subscribe {
-                        event_sub = Some(app.subscribe_events());
-                    }
 
+                    // The handshake response is ALWAYS written in JSON, even
+                    // when the client requested bincode1. Rationale (micro-level
+                    // correctness): if auth fails or an old daemon replies with
+                    // plain JSON to a binary-capable client, both peers must
+                    // still agree on the framing of this first response. The
+                    // actual upgrade happens later via `negotiate_codec`, whose
+                    // reply carries the negotiated codec and is therefore
+                    // self-identifying for the client.
+                    let _ = requested_codec; // consumed by negotiate_codec below
                     let wire_resp = WireMessage {
                         id: wire_req.id,
                         body: WireMessageBody::Response(resp),
                     };
 
-                    if let Ok(serialized) = serde_json::to_string(&wire_resp) {
-                        if serialized.len() <= MAX_IPC_FRAME_SIZE {
-                            let _ = writer
-                                .write_all(format!("{}\n", serialized).as_bytes())
-                                .await;
-                        }
+                    if let Ok(bytes) = wire::encode(&wire_resp, WireCodec::Json) {
+                        let _ = write_frame(&mut writer, &bytes).await;
                     }
 
                     if !authenticated {
@@ -296,10 +326,8 @@ impl IpcServer {
                             id: 0,
                             body: WireMessageBody::Response(IpcResponse::err(e)),
                         };
-                        if let Ok(s) = serde_json::to_string(&err_resp) {
-                            if s.len() <= MAX_IPC_FRAME_SIZE {
-                                let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
-                            }
+                        if let Ok(bytes) = wire::encode(&err_resp, WireCodec::Json) {
+                            let _ = write_frame(&mut writer, &bytes).await;
                         }
                         return;
                     }
@@ -312,31 +340,30 @@ impl IpcServer {
                                 "Handshake deadline timed out after 5 seconds",
                             ))),
                         };
-                        if let Ok(s) = serde_json::to_string(&err_resp) {
-                            if s.len() <= MAX_IPC_FRAME_SIZE {
-                                let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
-                            }
+                        if let Ok(bytes) = wire::encode(&err_resp, WireCodec::Json) {
+                            let _ = write_frame(&mut writer, &bytes).await;
                         }
                         return;
                     }
                 }
 
                 // 2. Authenticated command loop with idle timeout and outbound limits
+                let codec_reader = codec.clone();
+                let codec_writer = codec.clone();
                 loop {
                     tokio::select! {
                         frame_res = tokio::time::timeout(IDLE_TIMEOUT, read_bounded_frame(&mut reader, MAX_IPC_FRAME_SIZE)) => {
-                            let line = match frame_res {
-                                Ok(Ok(Some(l))) => l,
+                            let frame = match frame_res {
+                                Ok(Ok(Some(f))) => f,
                                 Ok(Ok(None)) => break, // EOF
                                 Ok(Err(e)) => {
                                     let err_resp = WireMessage {
                                         id: 0,
                                         body: WireMessageBody::Response(IpcResponse::err(e)),
                                     };
-                                    if let Ok(s) = serde_json::to_string(&err_resp) {
-                                        if s.len() <= MAX_IPC_FRAME_SIZE {
-                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
-                                        }
+                                    let cur = *codec_reader.lock().await;
+                                    if let Ok(bytes) = wire::encode(&err_resp, cur) {
+                                        let _ = write_frame(&mut writer, &bytes).await;
                                     }
                                     break;
                                 }
@@ -346,20 +373,16 @@ impl IpcServer {
                                 }
                             };
 
-                            let wire_req: WireMessage = match serde_json::from_str(&line) {
+                            let wire_req: WireMessage = match wire::decode(&frame) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     let err_resp = WireMessage {
                                         id: 0,
-                                        body: WireMessageBody::Response(IpcResponse::err(DomainError::new(
-                                            ErrorCode::InvalidRequest,
-                                            format!("JSON parse error: {}", e),
-                                        ))),
+                                        body: WireMessageBody::Response(IpcResponse::err(e)),
                                     };
-                                    if let Ok(s) = serde_json::to_string(&err_resp) {
-                                        if s.len() <= MAX_IPC_FRAME_SIZE {
-                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
-                                        }
+                                    let cur = *codec_reader.lock().await;
+                                    if let Ok(bytes) = wire::encode(&err_resp, cur) {
+                                        let _ = write_frame(&mut writer, &bytes).await;
                                     }
                                     continue;
                                 }
@@ -370,32 +393,64 @@ impl IpcServer {
                                 _ => continue,
                             };
 
-                            let (resp, subscribe) = Self::handle_request(&app, &auth, &mut authenticated, req).await;
+                            // Inbound frames are always decoded (both codecs are
+                            // accepted at any time), but the OUTBOUND codec only
+                            // changes through an explicit, authenticated
+                            // `negotiate_codec` exchange — never implicitly.
+                            let requested_switch: Option<WireCodec> = match &req {
+                                IpcRequest::NegotiateCodec { codec } => match codec.as_str() {
+                                    "bincode1" => Some(WireCodec::Bincode1),
+                                    "json" => Some(WireCodec::Json),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            let (resp, subscribe, _req_codec) = Self::handle_request(&app, &auth, &mut authenticated, req).await;
                             if subscribe {
                                 event_sub = Some(app.subscribe_events());
                             }
+                            // Switch ONLY when this exact request was a successful
+                            // negotiation (server answered Ok). Errors keep the
+                            // current framing — fail-closed.
+                            let negotiated_switch = requested_switch.filter(|_| matches!(&resp, IpcResponse::Ok { .. }));
 
                             let wire_resp = WireMessage {
                                 id: wire_req.id,
                                 body: WireMessageBody::Response(resp),
                             };
 
-                            if let Ok(serialized) = serde_json::to_string(&wire_resp) {
-                                if serialized.len() > MAX_IPC_FRAME_SIZE {
-                                    warn!("IPC response exceeded MAX_IPC_FRAME_SIZE; rejecting outbound frame");
+                            let mut cur = *codec_writer.lock().await;
+                            // Codec upgrade point (micro-level correctness):
+                            // the `negotiate_codec` ACK is written in the NEW
+                            // codec because every frame is self-identifying
+                            // (first-byte sniffing), so there is no ambiguous
+                            // transition window — the client switches on the
+                            // first byte it reads, never on assumptions.
+                            // A rejected/failed negotiation keeps JSON framing.
+                            if let Some(new_codec) = negotiated_switch {
+                                if new_codec != cur {
+                                    cur = new_codec;
+                                    *codec_writer.lock().await = cur;
+                                    info!("IPC client {} switched outbound codec to {}", peer_addr, cur.as_str());
+                                }
+                            }
+                            match wire::encode(&wire_resp, cur) {
+                                Ok(bytes) => {
+                                    if let Err(e) = write_frame(&mut writer, &bytes).await {
+                                        warn!("Failed to write IPC response: {}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    // Encoder refused an oversized payload before writing anything.
+                                    warn!("IPC response rejected by encoder: {}", e.message);
                                     let err_resp = WireMessage {
                                         id: wire_req.id,
-                                        body: WireMessageBody::Response(IpcResponse::err(DomainError::new(
-                                            ErrorCode::PayloadTooLarge,
-                                            format!("Response payload exceeds maximum allowed frame size of {} bytes", MAX_IPC_FRAME_SIZE),
-                                        ))),
+                                        body: WireMessageBody::Response(IpcResponse::err(e)),
                                     };
-                                    if let Ok(s) = serde_json::to_string(&err_resp) {
-                                        let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
+                                    if let Ok(bytes) = wire::encode(&err_resp, cur) {
+                                        let _ = write_frame(&mut writer, &bytes).await;
                                     }
-                                } else if let Err(e) = writer.write_all(format!("{}\n", serialized).as_bytes()).await {
-                                    warn!("Failed to write IPC response: {}", e);
-                                    break;
                                 }
                             }
                         }
@@ -417,10 +472,9 @@ impl IpcServer {
                                         id: 0,
                                         body: WireMessageBody::Notification(notif),
                                     };
-                                    if let Ok(s) = serde_json::to_string(&wire_notif) {
-                                        if s.len() <= MAX_IPC_FRAME_SIZE {
-                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
-                                        }
+                                    let cur = *codec_writer.lock().await;
+                                    if let Ok(bytes) = wire::encode(&wire_notif, cur) {
+                                        let _ = write_frame(&mut writer, &bytes).await;
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -431,10 +485,9 @@ impl IpcServer {
                                             reason: format!("Event queue lagged, missed {} events", missed),
                                         }),
                                     };
-                                    if let Ok(s) = serde_json::to_string(&wire_notif) {
-                                        if s.len() <= MAX_IPC_FRAME_SIZE {
-                                            let _ = writer.write_all(format!("{}\n", s).as_bytes()).await;
-                                        }
+                                    let cur = *codec_writer.lock().await;
+                                    if let Ok(bytes) = wire::encode(&wire_notif, cur) {
+                                        let _ = write_frame(&mut writer, &bytes).await;
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
@@ -453,13 +506,23 @@ impl IpcServer {
         auth: &AuthConfig,
         authenticated: &mut bool,
         req: IpcRequest,
-    ) -> (IpcResponse, bool) {
+    ) -> HandleResult {
         match req {
             IpcRequest::Handshake {
                 protocol_version,
                 client_name,
                 auth_token,
+                codec,
             } => {
+                // Parse the requested codec defensively: unknown/absent => JSON.
+                let requested = match codec.as_deref() {
+                    Some("bincode1") => Some(WireCodec::Bincode1),
+                    Some("json") | None => Some(WireCodec::Json),
+                    Some(other) => {
+                        warn!("Client requested unknown IPC codec '{}'; falling back to json", other);
+                        None
+                    }
+                };
                 if protocol_version != PROTOCOL_VERSION {
                     return (
                         IpcResponse::err(DomainError::new(
@@ -470,13 +533,14 @@ impl IpcServer {
                             ),
                         )),
                         false,
+                        None,
                     );
                 }
                 if let Some(t) = auth_token {
                     if auth.verify_token(&t) {
                         *authenticated = true;
                         info!("Client '{}' successfully authenticated", client_name);
-                        return (IpcResponse::ok_empty(), false);
+                        return (IpcResponse::ok_empty(), false, requested);
                     }
                 }
                 (
@@ -485,6 +549,7 @@ impl IpcServer {
                         "Invalid authentication token",
                     )),
                     false,
+                    None,
                 )
             }
             // All operations below require prior handshake authentication
@@ -494,51 +559,52 @@ impl IpcServer {
                     "Client is not authenticated. Perform handshake with valid auth_token first.",
                 )),
                 false,
+                None,
             ),
             IpcRequest::GetCapabilities => {
                 let caps = app.get_capabilities().await;
                 match IpcResponse::ok_data(caps) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 }
             }
             IpcRequest::GetDiscoveryPeers => {
                 let peers = app.get_discovered_peers().await;
                 match IpcResponse::ok_data(peers) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 }
             }
             IpcRequest::ListDevices => match app.list_devices().await {
                 Ok(devs) => match IpcResponse::ok_data(devs) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 },
-                Err(e) => (IpcResponse::err(e), false),
+                Err(e) => (IpcResponse::err(e), false, None),
             },
             IpcRequest::PairDevice { device_id } => match app.pair_device(&device_id).await {
                 Ok(out) => match IpcResponse::ok_data(out) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 },
-                Err(e) => (IpcResponse::err(e), false),
+                Err(e) => (IpcResponse::err(e), false, None),
             },
             IpcRequest::PingDevice { device_id } => match app.ping_device(&device_id).await {
                 Ok(out) => match IpcResponse::ok_data(out) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 },
-                Err(e) => (IpcResponse::err(e), false),
+                Err(e) => (IpcResponse::err(e), false, None),
             },
             IpcRequest::ShareFile {
                 device_id,
                 file_or_url,
             } => match app.share_file(&device_id, &file_or_url).await {
                 Ok(out) => match IpcResponse::ok_data(out) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 },
-                Err(e) => (IpcResponse::err(e), false),
+                Err(e) => (IpcResponse::err(e), false, None),
             },
             IpcRequest::StartMirror {
                 serial,
@@ -546,26 +612,43 @@ impl IpcServer {
                 record,
             } => match app.start_mirror(serial, camera, record).await {
                 Ok(sess) => match IpcResponse::ok_data(sess) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 },
-                Err(e) => (IpcResponse::err(e), false),
+                Err(e) => (IpcResponse::err(e), false, None),
             },
             IpcRequest::StopMirror { session_id } => match app.stop_mirror(session_id).await {
                 Ok(sess) => match IpcResponse::ok_data(sess) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 },
-                Err(e) => (IpcResponse::err(e), false),
+                Err(e) => (IpcResponse::err(e), false, None),
             },
             IpcRequest::GetSession => {
                 let sess = app.get_active_session().await;
                 match IpcResponse::ok_data(sess) {
-                    Ok(r) => (r, false),
-                    Err(e) => (IpcResponse::err(e), false),
+                    Ok(r) => (r, false, None),
+                    Err(e) => (IpcResponse::err(e), false, None),
                 }
             }
-            IpcRequest::SubscribeEvents => (IpcResponse::ok_empty(), true),
+            // In-session codec upgrade. The guard arm above already rejects this
+            // request when the client is unauthenticated, so reaching here means
+            // the session holds a valid token. Negotiation is idempotent:
+            // re-negotiating `json` downgrades, `bincode1` upgrades.
+            IpcRequest::NegotiateCodec { codec } => match codec.as_str() {
+                "json" => (IpcResponse::ok_data("json").unwrap_or_else(|_| IpcResponse::ok_empty()), false, Some(WireCodec::Json)),
+                "bincode1" => (IpcResponse::ok_data("bincode1").unwrap_or_else(|_| IpcResponse::ok_empty()), false, Some(WireCodec::Bincode1)),
+                other => (
+                    IpcResponse::err(DomainError::with_detail(
+                        ErrorCode::InvalidRequest,
+                        format!("Unsupported IPC codec '{}'", other),
+                        "supported codecs: json, bincode1",
+                    )),
+                    false,
+                    None,
+                ),
+            },
+            IpcRequest::SubscribeEvents => (IpcResponse::ok_empty(), true, Some(WireCodec::Json)),
         }
     }
 }
