@@ -1,0 +1,92 @@
+{
+    // ───────── Editor ─────────
+    "editor.formatOnSave": true,
+    "editor.formatOnPaste": false,
+    "editor.rulers": [
+        100
+    ],
+    "editor.bracketPairColorization.enabled": true,
+    "editor.guides.bracketPairs": "active",
+    "editor.renderWhitespace": "selection",
+    "editor.stickyScroll.enabled": true,
+    "editor.inlayHints.enabled": "onUnlessPressed",
+    "editor.codeActionsOnSave": {
+        "source.fixAll": "explicit"
+    },
+    // ───────── Files (يمنع مشاكل diff و line endings) ─────────
+    "files.eol": "\n",
+    "files.encoding": "utf8",
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    "files.trimFinalNewlines": true,
+    "files.autoSave": "onFocusChange",
+    // ───────── أداء: استبعاد فولدرات البناء ─────────
+    "files.watcherExclude": {
+        "**/target/**": true,
+        "**/.dart_tool/**": true,
+        "**/build/**": true,
+        "**/.git/objects/**": true
+    },
+    "search.exclude": {
+        "**/target": true,
+        "**/.dart_tool": true,
+        "**/build": true,
+        "**/*.lock": true
+    },
+    // ───────── Dart / Flutter ─────────
+    // مفيش dart.flutterSdkPath: الإضافة بتلاقيه من الـ PATH.
+    // لو محتاج مسار ثابت: "dart.flutterSdkPath": "C:\\src\\flutter"
+    "dart.lineLength": 80,
+    "dart.runPubGetOnPubspecChanges": "always",
+    "dart.closingLabels": true,
+    "dart.previewFlutterUiGuides": true,
+    "dart.hotReloadOnSave": "allIfDirty",
+    "dart.showTodos": true,
+    "dart.analysisExcludedFolders": [
+        ".dart_tool",
+        "build"
+    ],
+    // ───────── Rust ─────────
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.check.allTargets": true,
+    "rust-analyzer.cargo.features": "all",
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "rust-analyzer.procMacro.enable": true,
+    "rust-analyzer.completion.autoimport.enable": true,
+    "rust-analyzer.imports.granularity.group": "module",
+    // لو Cargo.toml مش في الـ root (مثلاً rust/Cargo.toml) فك التعليق:
+    // "rust-analyzer.linkedProjects": ["rust/Cargo.toml"],
+    // ───────── Per-language ─────────
+    "[dart]": {
+        "editor.defaultFormatter": "Dart-Code.dart-code",
+        "editor.tabSize": 2,
+        "editor.insertSpaces": true,
+        "editor.rulers": [
+            80
+        ],
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit",
+            "source.organizeImports": "explicit"
+        }
+    },
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.rulers": [
+            100
+        ]
+    },
+    "[json]": {
+        "editor.tabSize": 2
+    },
+    "[jsonc]": {
+        "editor.tabSize": 2
+    },
+    "[yaml]": {
+        "editor.tabSize": 2
+    },
+    "[markdown]": {
+        "files.trimTrailingWhitespace": false
+    }
+}

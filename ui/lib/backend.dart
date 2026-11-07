@@ -1,253 +1,246 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 
-/// Represents a device known to the hub.
+/// Manages connection lifecycle states to prevent race conditions.
+enum IpcConnectionState { disconnected, connecting, connected, failed }
+
+/// Generic, type-safe wrapper for IPC operation results.
+class ToolResult<T> {
+  final bool success;
+  final String message;
+  final T? data;
+  final Object? error;
+
+  const ToolResult._({required this.success, required this.message, this.data, this.error});
+
+  factory ToolResult.success(String message, [T? data]) =>
+      ToolResult._(success: true, message: message, data: data);
+
+  factory ToolResult.failure(String message, [Object? error]) =>
+      ToolResult._(success: false, message: message, error: error);
+}
+
+/// Safe parsing extensions to prevent runtime crashes on malformed JSON.
+extension SafeMap on Map<String, dynamic> {
+  String getStr(String key, [String fallback = '']) => this[key] is String ? this[key] as String : fallback;
+  int getInt(String key, [int fallback = 0]) => this[key] is int ? this[key] as int : (this[key] is num ? (this[key] as num).toInt() : fallback);
+  bool getBool(String key, [bool fallback = false]) => this[key] is bool ? this[key] as bool : fallback;
+  Map<String, dynamic>? getMap(String key) => this[key] is Map<String, dynamic> ? this[key] as Map<String, dynamic> : null;
+  List<dynamic>? getList(String key) => this[key] is List ? this[key] as List<dynamic> : null;
+}
+
 class DeviceInfo {
-  final String id;
-  final String name;
-  final String origin;
-  final bool paired;
-  final bool reachable;
+  final String id, name, origin;
+  final bool paired, reachable;
   final String? address;
 
   const DeviceInfo({
-    required this.id,
-    required this.name,
-    required this.origin,
-    required this.paired,
-    required this.reachable,
-    this.address,
+    required this.id, required this.name, required this.origin,
+    required this.paired, required this.reachable, this.address,
   });
 
   factory DeviceInfo.fromJson(Map<String, dynamic> json) => DeviceInfo(
-        id: json['id'] as String,
-        name: json['name'] as String,
-        origin: json['origin'] as String,
-        paired: json['paired'] as bool? ?? false,
-        reachable: json['reachable'] as bool? ?? false,
-        address: json['address'] as String?,
-      );
+    id: json.getStr('id', 'unknown'),
+    name: json.getStr('name', 'Unknown Device'),
+    origin: json.getStr('origin', 'unknown'),
+    paired: json.getBool('paired'),
+    reachable: json.getBool('reachable'),
+    address: json.getStr('address').isEmpty ? null : json.getStr('address'),
+  );
 }
 
-/// Represents an active or completed streaming session.
 class StreamSession {
-  final String sessionId;
-  final String kind;
-  final String? deviceSerial;
-  final String state;
+  final String sessionId, kind, state;
+  final String? deviceSerial, lastError;
   final int startedAtMs;
-  final int? pid;
-  final int? exitCode;
-  final String? lastError;
+  final int? pid, exitCode;
 
   const StreamSession({
-    required this.sessionId,
-    required this.kind,
-    this.deviceSerial,
-    required this.state,
-    required this.startedAtMs,
-    this.pid,
-    this.exitCode,
-    this.lastError,
+    required this.sessionId, required this.kind, required this.state,
+    this.deviceSerial, this.lastError, required this.startedAtMs, this.pid, this.exitCode,
   });
 
   factory StreamSession.fromJson(Map<String, dynamic> json) => StreamSession(
-        sessionId: json['session_id'] as String,
-        kind: json['kind'] as String,
-        deviceSerial: json['device_serial'] as String?,
-        state: json['state'] as String,
-        startedAtMs: (json['started_at_ms'] as num).toInt(),
-        pid: json['pid'] as int?,
-        exitCode: json['exit_code'] as int?,
-        lastError: json['last_error'] as String?,
-      );
+    sessionId: json.getStr('session_id'),
+    kind: json.getStr('kind'),
+    state: json.getStr('state', 'unknown'),
+    deviceSerial: json.getStr('device_serial').isEmpty ? null : json.getStr('device_serial'),
+    startedAtMs: json.getInt('started_at_ms', 0),
+    pid: json['pid'] is int ? json['pid'] as int : null,
+    exitCode: json['exit_code'] is int ? json['exit_code'] as int : null,
+    lastError: json.getStr('last_error').isEmpty ? null : json.getStr('last_error'),
+  );
 }
 
-class ToolResult {
-  final bool ok;
-  final String text;
-  final dynamic data;
-  const ToolResult(this.ok, this.text, [this.data]);
+/// Centralized validation logic to prevent argument injection.
+class DeviceValidator {
+  static final RegExp _validIdRegex = RegExp(r'^[A-Za-z0-9_.:-]+$');
+
+  static bool isValid(String id) =>
+      id.isNotEmpty && id.length <= 128 && !id.startsWith('-') && _validIdRegex.hasMatch(id);
 }
 
-/// Validates device identifiers strictly to prevent argument injection
-bool validDeviceId(String id) {
-  if (id.isEmpty || id.length > 128 || id.startsWith('-')) return false;
-  return RegExp(r'^[A-Za-z0-9_.:-]+$').hasMatch(id);
-}
-
-/// Typed client for Rust Hub IPC daemon over authenticated local loopback transport.
+/// Robust IPC client with auto-recovery and memory leak prevention.
 class NexusIpcClient {
   final String host;
   final int port;
+
   Socket? _socket;
-  bool _authenticated = false;
+  IpcConnectionState _state = IpcConnectionState.disconnected;
   Future<void>? _connectingFuture;
-  StreamSubscription? _sub;
+  StreamSubscription<String>? _sub;
+
   int _seq = 1;
+  static const int _maxPendingRequests = 500;
   final Map<int, Completer<Map<String, dynamic>>> _pending = {};
-  final StreamController<Map<String, dynamic>> _events =
-      StreamController<Map<String, dynamic>>.broadcast();
+
+  final StreamController<Map<String, dynamic>> _events = StreamController<Map<String, dynamic>>.broadcast(
+    onCancel: () => debugPrint('IPC Events stream canceled'),
+  );
+  final StreamController<IpcConnectionState> _stateController = StreamController<IpcConnectionState>.broadcast();
 
   NexusIpcClient({this.host = '127.0.0.1', this.port = 8788});
 
-  /// True ONLY when the socket is connected AND handshake has been accepted by daemon.
-  bool get isConnected => _socket != null && _authenticated;
+  IpcConnectionState get state => _state;
+  bool get isConnected => _state == IpcConnectionState.connected; // Added for test compatibility
+  Stream<IpcConnectionState> get stateStream => _stateController.stream;
   Stream<Map<String, dynamic>> get events => _events.stream;
 
-  static String? readAuthToken() {
-    try {
-      final env = Platform.environment;
-      String runDirPath;
-      if (Platform.isWindows) {
-        final localAppData = env['LOCALAPPDATA'];
-        if (localAppData != null) {
-          runDirPath = '$localAppData\\NexusHub\\run';
-        } else {
-          final profile = env['USERPROFILE'] ?? '';
-          runDirPath = '$profile\\.nexus_hub\\run';
-        }
-      } else {
-        final xdg = env['XDG_RUNTIME_DIR'];
-        if (xdg != null) {
-          // Match Rust: $XDG_RUNTIME_DIR/nexus_hub/
-          runDirPath = '$xdg/nexus_hub';
-        } else {
-          final home = env['HOME'] ?? '';
-          // Match Rust: $HOME/.nexus_hub/run
-          runDirPath = '$home/.nexus_hub/run';
-        }
-      }
-      final file = File('$runDirPath${Platform.pathSeparator}nexus_ipc.token');
-      if (file.existsSync()) {
-        return file.readAsStringSync().trim();
-      }
-    } catch (_) {}
-    return null;
+  void _updateState(IpcConnectionState newState) {
+    if (_state != newState) {
+      _state = newState;
+      if (!_stateController.isClosed) _stateController.add(newState);
+    }
   }
 
-  /// Single-flight connection establishment.
-  /// Guarantees that concurrent callers wait on the same connection attempt,
-  /// and NO request can bypass the handshake phase.
-  Future<void> connect() async {
-    if (_socket != null && _authenticated) return;
-    if (_connectingFuture != null) {
-      await _connectingFuture;
-      return;
+  static String? _readAuthToken() {
+    try {
+      final env = Platform.environment;
+      final String runDirPath = Platform.isWindows
+          ? (env['LOCALAPPDATA'] != null ? '${env['LOCALAPPDATA']}\\NexusHub\\run' : '${env['USERPROFILE'] ?? ''}\\.nexus_hub\\run')
+          : (env['XDG_RUNTIME_DIR'] != null ? '${env['XDG_RUNTIME_DIR']}/nexus_hub' : '${env['HOME'] ?? ''}/.nexus_hub/run');
+
+      final file = File('$runDirPath${Platform.pathSeparator}nexus_ipc.token');
+      return file.existsSync() ? file.readAsStringSync().trim() : null;
+    } catch (e) {
+      debugPrint('Token read error: $e');
+      return null;
     }
+  }
+
+  Future<void> connect() async {
+    if (_state == IpcConnectionState.connected) return;
+    if (_connectingFuture != null) return _connectingFuture;
+
+    _updateState(IpcConnectionState.connecting);
     _connectingFuture = _doConnect();
+
     try {
       await _connectingFuture;
+    } catch (e) {
+      _updateState(IpcConnectionState.failed);
+      rethrow;
     } finally {
       _connectingFuture = null;
     }
   }
 
   Future<void> _doConnect() async {
-    _cleanup();
-    final s = await Socket.connect(host, port, timeout: const Duration(seconds: 3));
-    s.transform(utf8.decoder).transform(const LineSplitter()).listen(
-      _onLine,
-      onError: (err) {
-        _cleanup();
-      },
-      onDone: () {
-        _cleanup();
-      },
-    );
+    _cleanup(keepState: false);
 
-    // Perform Handshake on raw connection BEFORE assigning to _socket
-    final token = readAuthToken();
-    final res = await _writeRaw(s, 'handshake', {
-      'protocol_version': 1,
-      'client_name': 'flutter-desktop-ui',
-      if (token != null) 'auth_token': token,
-    });
+    try {
+      final s = await Socket.connect(host, port, timeout: const Duration(seconds: 3));
 
-    if (res['status'] != 'ok') {
-      final err = res['error']?['message'] ?? 'Authentication failed';
-      s.destroy();
-      _cleanup();
-      throw Exception('IPC handshake rejected: ' + err.toString());
+      _sub = s
+          .cast<List<int>>()
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .transform(const LineSplitter())
+          .listen(
+            _onLine,
+            onError: (err) { debugPrint('IPC Stream Error: $err'); _handleDisconnect(); },
+            onDone: () { debugPrint('IPC Stream Closed'); _handleDisconnect(); },
+          );
+
+      final token = _readAuthToken();
+      final res = await _sendRawRequest(s, 'handshake', {
+        'protocol_version': 1,
+        'client_name': 'flutter-desktop-ui',
+        if (token != null) 'auth_token': token,
+      });
+
+      if (res.getStr('status') != 'ok') {
+        s.destroy();
+        _cleanup(keepState: false);
+        throw Exception('Handshake rejected: ${res.getMap('error')?.getStr('message', 'Unknown')}');
+      }
+
+      _socket = s;
+      _updateState(IpcConnectionState.connected);
+      unawaited(_sendRawRequest(s, 'subscribe_events', null));
+
+    } catch (e) {
+      _cleanup(keepState: false);
+      rethrow;
     }
-
-    // Handshake confirmed by daemon: mark authenticated and assign socket
-    _socket = s;
-    _authenticated = true;
-
-    // Subscribe to daemon events
-    unawaited(_call('subscribe_events', null));
   }
 
-  void _cleanup() {
-    _authenticated = false;
+  void _handleDisconnect() {
+    if (_state == IpcConnectionState.disconnected) return;
+    _cleanup(keepState: true);
+
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (_state != IpcConnectionState.disconnected) {
+        debugPrint('Attempting auto-reconnect...');
+        connect().catchError((e) => debugPrint('Auto-reconnect failed: $e'));
+      }
+    });
+  }
+
+  void _cleanup({bool keepState = false}) {
+    _sub?.cancel();
+    _sub = null;
     _socket?.destroy();
     _socket = null;
+
     for (final completer in _pending.values) {
       if (!completer.isCompleted) {
-        completer.completeError(Exception('IPC connection closed'));
+        completer.completeError(StateError('IPC connection lost'));
       }
     }
     _pending.clear();
+
+    if (!keepState) _updateState(IpcConnectionState.disconnected);
   }
 
   void _onLine(String line) {
     if (line.trim().isEmpty) return;
     try {
-      final decoded = jsonDecode(line) as Map<String, dynamic>;
-      final id = decoded['id'] as int?;
-      if (id != null && id != 0) {
-        final completer = _pending.remove(id);
-        completer?.complete(decoded);
-      } else if (decoded.containsKey('event')) {
+      final decoded = jsonDecode(line);
+      if (decoded is! Map<String, dynamic>) return;
+
+      final id = decoded['id'];
+      if (id is int && id != 0) {
+        _pending.remove(id)?.complete(decoded);
+      } else if (decoded.containsKey('event') && !_events.isClosed) {
         _events.add(decoded);
       }
-    } catch (_) {}
-  }
-
-  Future<Map<String, dynamic>> _writeRaw(Socket s, String action, dynamic payload) {
-    final id = _seq++;
-    final completer = Completer<Map<String, dynamic>>();
-    _pending[id] = completer;
-
-    final req = jsonEncode({
-      'id': id,
-      'action': action,
-      if (payload != null) 'payload': payload,
-    });
-
-    s.write('$req\n');
-
-    return completer.future.timeout(
-      const Duration(seconds: 15),
-      onTimeout: () {
-        _pending.remove(id);
-        throw TimeoutException('Handshake timed out: $action');
-      },
-    );
-  }
-
-  Future<Map<String, dynamic>> _call(String action, dynamic payload) async {
-    if (!_authenticated) {
-      await connect();
+    } catch (e, stack) {
+      debugPrint('JSON Parse Error on line: $line\n$e\n$stack');
     }
-    final s = _socket;
-    if (s == null || !_authenticated) {
-      throw StateError('Cannot send request: IPC client is not authenticated');
+  }
+
+  Future<Map<String, dynamic>> _sendRawRequest(Socket s, String action, dynamic payload) async {
+    if (_pending.length >= _maxPendingRequests) {
+      throw StateError('Max pending requests reached. Possible memory leak or daemon freeze.');
     }
 
     final id = _seq++;
     final completer = Completer<Map<String, dynamic>>();
     _pending[id] = completer;
 
-    final req = jsonEncode({
-      'id': id,
-      'action': action,
-      if (payload != null) 'payload': payload,
-    });
-
-    s.write('$req\n');
+    s.write('${jsonEncode({'id': id, 'action': action, if (payload != null) 'payload': payload})}\n');
 
     return completer.future.timeout(
       const Duration(seconds: 15),
@@ -258,135 +251,114 @@ class NexusIpcClient {
     );
   }
 
-  Future<ToolResult> getCapabilities() async {
+  Future<Map<String, dynamic>> _call(String action, dynamic payload) async {
+    if (_state != IpcConnectionState.connected) await connect();
+
+    final s = _socket;
+    if (s == null || _state != IpcConnectionState.connected) {
+      throw StateError('Cannot send request: Client is not connected');
+    }
+    return _sendRawRequest(s, action, payload);
+  }
+
+  // ───────── Public API ─────────
+
+  Future<ToolResult<Map<String, dynamic>>> getCapabilities() async {
     try {
       final res = await _call('get_capabilities', null);
-      if (res['status'] == 'ok') {
-        return ToolResult(true, 'Capabilities received', res['data']);
-      }
-      return ToolResult(false, res['error']?['message'] ?? 'Unknown error');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      return res.getStr('status') == 'ok'
+          ? ToolResult.success('Capabilities received', res.getMap('data'))
+          : ToolResult.failure(res.getMap('error')?.getStr('message', 'Unknown error') ?? 'Unknown error');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<List<dynamic>> getDiscoveryPeers() async {
+  Future<ToolResult<List<dynamic>>> getDiscoveryPeers() async {
     try {
       final res = await _call('get_discovery_peers', null);
-      if (res['status'] == 'ok' && res['data'] is List) {
-        return res['data'] as List<dynamic>;
-      }
-    } catch (_) {}
-    return [];
+      return res.getStr('status') == 'ok' && res.getList('data') != null
+          ? ToolResult.success('Peers retrieved', res.getList('data'))
+          : ToolResult.success('No peers found', []);
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<ToolResult> listDevices() async {
+  Future<ToolResult<List<DeviceInfo>>> listDevices() async {
     try {
       final res = await _call('list_devices', null);
-      if (res['status'] == 'ok') {
-        final list = (res['data'] as List<dynamic>?) ?? [];
-        final parsed = list.map((item) => DeviceInfo.fromJson(item as Map<String, dynamic>)).toList();
-        final text = parsed.isEmpty
-            ? 'No paired KDE devices found.'
-            : parsed.map((d) => '${d.id}: ${d.name}').join('\n');
-        return ToolResult(true, text, parsed);
+      if (res.getStr('status') == 'ok' && res.getList('data') != null) {
+        final parsed = res.getList('data')!.map((e) => DeviceInfo.fromJson(e is Map<String, dynamic> ? e : {})).toList();
+        return ToolResult.success(parsed.isEmpty ? 'No devices found' : 'Devices retrieved', parsed);
       }
-      return ToolResult(false, res['error']?['message'] ?? 'Failed to list devices');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      return ToolResult.failure(res.getMap('error')?.getStr('message', 'Failed') ?? 'Failed');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<ToolResult> pairDevice(String id) async {
-    if (!validDeviceId(id)) return const ToolResult(false, 'Invalid device id');
+  Future<ToolResult<String>> pairDevice(String id) async {
+    if (!DeviceValidator.isValid(id)) return ToolResult.failure('Invalid device ID');
     try {
       final res = await _call('pair_device', {'device_id': id});
-      if (res['status'] == 'ok') {
-        return ToolResult(true, (res['data'] as String?) ?? 'Pair requested');
-      }
-      return ToolResult(false, res['error']?['message'] ?? 'Pair failed');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      return res.getStr('status') == 'ok'
+          ? ToolResult.success(res.getStr('data', 'Pair requested'))
+          : ToolResult.failure(res.getMap('error')?.getStr('message', 'Pair failed') ?? 'Pair failed');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<ToolResult> pingDevice(String id) async {
-    if (!validDeviceId(id)) return const ToolResult(false, 'Invalid device id');
+  Future<ToolResult<String>> pingDevice(String id) async {
+    if (!DeviceValidator.isValid(id)) return ToolResult.failure('Invalid device ID');
     try {
       final res = await _call('ping_device', {'device_id': id});
-      if (res['status'] == 'ok') {
-        return ToolResult(true, (res['data'] as String?) ?? 'Ping OK');
-      }
-      return ToolResult(false, res['error']?['message'] ?? 'Ping failed');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      return res.getStr('status') == 'ok'
+          ? ToolResult.success(res.getStr('data', 'Ping OK'))
+          : ToolResult.failure(res.getMap('error')?.getStr('message', 'Ping failed') ?? 'Ping failed');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<ToolResult> shareFile(String id, String path) async {
-    if (!validDeviceId(id)) return const ToolResult(false, 'Invalid device id');
-    if (path.trim().isEmpty) return const ToolResult(false, 'Path cannot be empty');
+  Future<ToolResult<String>> shareFile(String id, String path) async {
+    if (!DeviceValidator.isValid(id)) return ToolResult.failure('Invalid device ID');
+    if (path.trim().isEmpty) return ToolResult.failure('Path cannot be empty');
     try {
       final res = await _call('share_file', {'device_id': id, 'file_or_url': path});
-      if (res['status'] == 'ok') {
-        return ToolResult(true, (res['data'] as String?) ?? 'File shared');
-      }
-      return ToolResult(false, res['error']?['message'] ?? 'Share failed');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      return res.getStr('status') == 'ok'
+          ? ToolResult.success(res.getStr('data', 'File shared'))
+          : ToolResult.failure(res.getMap('error')?.getStr('message', 'Share failed') ?? 'Share failed');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<ToolResult> startMirror({String? serial, bool camera = false, String? recording}) async {
-    if (serial != null && serial.isNotEmpty && !validDeviceId(serial)) {
-      return const ToolResult(false, 'Invalid ADB serial');
+  Future<ToolResult<StreamSession>> startMirror({String? serial, bool camera = false, String? recording}) async {
+    if (serial != null && serial.isNotEmpty && !DeviceValidator.isValid(serial)) {
+      return ToolResult.failure('Invalid ADB serial');
     }
     try {
-      final res = await _call('start_mirror', {
-        'serial': (serial != null && serial.isNotEmpty) ? serial : null,
-        'camera': camera,
-        'record': recording,
-      });
-      if (res['status'] == 'ok') {
-        final sess = StreamSession.fromJson(res['data'] as Map<String, dynamic>);
-        return ToolResult(
-          true,
-          'Started scrcpy (session: ${sess.sessionId}, PID: ${sess.pid ?? "unknown"}). Video opens in a separate native window.',
-          sess,
-        );
+      final res = await _call('start_mirror', {'serial': serial?.isNotEmpty == true ? serial : null, 'camera': camera, 'record': recording});
+      if (res.getStr('status') == 'ok' && res.getMap('data') != null) {
+        final sess = StreamSession.fromJson(res.getMap('data')!);
+        return ToolResult.success('Started scrcpy (PID: ${sess.pid ?? "unknown"})', sess);
       }
-      return ToolResult(false, res['error']?['message'] ?? 'Failed to start scrcpy');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      return ToolResult.failure(res.getMap('error')?.getStr('message', 'Failed to start') ?? 'Failed to start');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<ToolResult> stopMirror({String? sessionId}) async {
+  Future<ToolResult<String>> stopMirror({String? sessionId}) async {
     try {
-      final res = await _call('stop_mirror', {
-        'session_id': sessionId,
-      });
-      if (res['status'] == 'ok') {
-        return const ToolResult(true, 'Stream stopped successfully');
-      }
-      return ToolResult(false, res['error']?['message'] ?? 'Failed to stop stream');
-    } catch (e) {
-      return ToolResult(false, 'Daemon communication error: $e');
-    }
+      final res = await _call('stop_mirror', {'session_id': sessionId});
+      return res.getStr('status') == 'ok'
+          ? ToolResult.success('Stream stopped')
+          : ToolResult.failure(res.getMap('error')?.getStr('message', 'Failed to stop') ?? 'Failed to stop');
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
-  Future<StreamSession?> getSession() async {
+  Future<ToolResult<StreamSession?>> getSession() async {
     try {
       final res = await _call('get_session', null);
-      if (res['status'] == 'ok' && res['data'] != null) {
-        return StreamSession.fromJson(res['data'] as Map<String, dynamic>);
+      if (res.getStr('status') == 'ok' && res.getMap('data') != null) {
+        return ToolResult.success('Session retrieved', StreamSession.fromJson(res.getMap('data')!));
       }
-    } catch (_) {}
-    return null;
+      return ToolResult.success('No active session', null);
+    } catch (e) { return ToolResult.failure('Communication error', e); }
   }
 
   void dispose() {
-    _cleanup();
-    _events.close();
+    _cleanup(keepState: false);
+    if (!_events.isClosed) _events.close();
+    if (!_stateController.isClosed) _stateController.close();
   }
 }
